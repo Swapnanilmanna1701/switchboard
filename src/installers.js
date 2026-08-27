@@ -358,7 +358,13 @@ const STANZA_BODY = `## Concurrent sessions
 Other AI sessions may be working in this repo right now.
 Before starting a task, call \`sb_peers\` (MCP) — or read
 \`.switchboard/ROSTER.md\` — to see what they're doing and which
-files they've claimed. Post findings with \`sb_note\`.`;
+files they've claimed. Post findings with \`sb_note\`.
+
+Every session has a name describing what it is doing, e.g. \`fix-auth-tokens\`.
+
+- If the user writes \`@<session-name>\`, they are referring to that session:
+  call \`sb_session\` with that name and use what it returns.
+- To continue another session's work, call \`sb_attach\` with its name.`;
 
 const STANZA = `${MARK_BEGIN}\n${STANZA_BODY}\n${MARK_END}\n`;
 
@@ -366,14 +372,30 @@ const STANZA = `${MARK_BEGIN}\n${STANZA_BODY}\n${MARK_END}\n`;
 // git-excluded ROSTER.md, so the repo never sees a diff from us.
 function agentsMd(workspace) {
   const file = path.join(workspace, 'AGENTS.md');
+  const between = new RegExp(`${escapeRe(MARK_BEGIN)}[\\s\\S]*?${escapeRe(MARK_END)}`);
+
   return {
     file,
+    // "Installed" means the CURRENT stanza is present, not merely some stanza.
+    // Checking only for the marker meant a later version of the text could
+    // never reach a repo that had already been initialised.
     installed: () => {
-      try { return fs.readFileSync(file, 'utf8').includes(MARK_BEGIN); } catch { return false; }
+      try {
+        const cur = fs.readFileSync(file, 'utf8');
+        const m = cur.match(between);
+        return !!m && m[0].trim() === STANZA.trim();
+      } catch { return false; }
     },
     apply: () => {
       const cur = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '# AGENTS.md\n';
-      if (cur.includes(MARK_BEGIN)) return null;
+      if (cur.match(between)) {
+        // Rewrite in place, between the markers, so the user's surrounding
+        // content and the stanza's position in the file are both preserved.
+        const next = cur.replace(between, STANZA.trim());
+        if (next === cur) return null;
+        fs.writeFileSync(file, next);
+        return file;
+      }
       fs.writeFileSync(file, `${cur.trimEnd()}\n\n${STANZA}`);
       return file;
     },
@@ -435,6 +457,83 @@ function claudeBridge(workspace) {
 }
 
 function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// ---- the /sbs slash command ------------------------------------------------
+
+// Claude Code and Cursor both read project slash commands from a directory of
+// markdown files. One command is enough: `/sbs` opens the picker, and a
+// session is referenced by NAME with @<name>. There is nothing left for a
+// numbered command to address.
+const SBS_LIST_BODY = `---
+description: Pick a session to continue (interactive list, live and ended)
+---
+
+Call the \`sb_pick\` tool with no arguments.
+
+It shows me an interactive list of every session in this workspace — live and
+ended — that I select from directly with the arrow keys. Do NOT print the list
+yourself and do NOT ask me which one in text: the tool does the asking.
+
+Whatever it returns is the chosen session's full context. Tell me in two or
+three lines what that session was doing and where it left off, then continue
+its work from there.
+
+If it reports that no session was selected, stop and say so — do not pick one
+for me.
+`;
+
+// Both agents use <root>/commands/<name>.md, they just differ on the root.
+function slashCommands(workspace, opts = {}) {
+  const dirs = [
+    path.join(workspace, '.claude', 'commands'),
+    path.join(workspace, '.cursor', 'commands'),
+  ].filter(d => opts.all || fs.existsSync(path.dirname(d)) ||
+                agentPresent(d.includes('.cursor') ? 'cursor' : 'claude-code', workspace, opts.home || HOME));
+
+  // One command. Sessions are addressed by NAME, so there is nothing for
+  // numbered commands to mean — the picker chooses, @<name> references.
+  const files = dir => [[path.join(dir, 'sbs.md'), SBS_LIST_BODY]];
+
+  return {
+    file: dirs[0] || path.join(workspace, '.claude', 'commands'),
+    dirs,
+    // "Installed" means every command file matches the CURRENT body, not just
+    // that some file exists. Checking existence meant an updated command could
+    // never reach a repo that had already been initialised — the same bug the
+    // AGENTS.md stanza had, so both now compare content.
+    installed: () => dirs.length > 0 && dirs.every(dir =>
+      files(dir).every(([f, body]) => {
+        try { return fs.readFileSync(f, 'utf8') === body; } catch { return false; }
+      })),
+    apply: () => {
+      if (!dirs.length) return null;
+      let wrote = null;
+      for (const dir of dirs) {
+        fs.mkdirSync(dir, { recursive: true });
+        for (const [f, body] of files(dir)) {
+          let cur = null;
+          try { cur = fs.readFileSync(f, 'utf8'); } catch { /* new file */ }
+          if (cur === body) continue;              // idempotent: skip unchanged
+          fs.writeFileSync(f, body);
+          wrote = wrote || dir;
+        }
+      }
+      return wrote;
+    },
+    revert: () => {
+      let removed = null;
+      for (const dir of dirs) {
+        for (const [f] of files(dir)) {
+          if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); removed = removed || dir; }
+        }
+        // Only remove the directory if it is now empty — the user may keep
+        // their own commands alongside ours.
+        try { if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) fs.rmdirSync(dir); } catch { /* keep */ }
+      }
+      return removed;
+    },
+  };
+}
 
 // ---- status line indicator -------------------------------------------------
 
@@ -510,6 +609,11 @@ function plan(workspace, opts = {}) {
   const a = agentsMd(workspace);
   items.push({ agent: 'all', label: 'AGENTS.md stanza', kind: 'context', tier: 0, file: a.file,
     detected: true, installed: a.installed(), action: a.installed() ? 'ok' : 'write', w: a });
+  const sc = slashCommands(workspace, opts);
+  items.push({ agent: 'all', label: '/sbs slash command', kind: 'context', tier: 0,
+    file: sc.file, detected: true, installed: sc.installed(),
+    action: sc.installed() ? 'ok' : 'write', w: sc });
+
   const c = claudeBridge(workspace);
   items.push({ agent: 'claude-code', label: 'CLAUDE.md @AGENTS.md bridge', kind: 'context', tier: 0, file: c.file,
     detected: true, installed: c.installed(), action: c.installed() ? 'ok' : 'write', w: c });
@@ -550,6 +654,7 @@ function revert(workspace, opts = {}) {
     ...targets(workspace, opts),
     { agent: 'all', label: 'AGENTS.md stanza', kind: 'context', w: agentsMd(workspace), file: path.join(workspace, 'AGENTS.md') },
     { agent: 'claude-code', label: 'CLAUDE.md bridge', kind: 'context', w: claudeBridge(workspace), file: path.join(workspace, 'CLAUDE.md') },
+    { agent: 'all', label: '/sbs slash commands', kind: 'context', w: slashCommands(workspace, { ...opts, all: true }), file: path.join(workspace, '.claude/commands') },
   ];
   for (const t of all) {
     try { const f = t.w.revert(); if (f) removed.push({ ...t, removed: f }); }
@@ -560,7 +665,7 @@ function revert(workspace, opts = {}) {
 }
 
 module.exports = {
-  targets, plan, apply, revert, agentsMd, claudeBridge, agentPresent, statusLine,
+  targets, plan, apply, revert, agentsMd, claudeBridge, agentPresent, statusLine, slashCommands,
   serverSpec, hookCommand, STANZA, STANZA_BODY, MARK_BEGIN, MARK_END,
   CLAUDE_HOOKS, CURSOR_HOOKS, GEMINI_HOOKS,
 };

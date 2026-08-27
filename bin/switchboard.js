@@ -35,6 +35,9 @@ function main() {
     case 'uninstall': return uninstall();
     case 'purge':     return purge();
     case 'attach':    return attach();
+    case 'sessions': case 'ls': return sessions();
+    case 'sbs':  case 'pick': return sbs();
+    case 'mode':      return mode();
     case 'statusline': return statusline();
     case 'version': case 'v': return console.log(pkg.version);
     default:          return help();
@@ -112,8 +115,10 @@ function status() {
       const claims = ctx.claimsBySession[p.session_id] || [];
       const d = ctx.digestBySession[p.session_id];
       const tier = p.tier >= 3 ? c.g('T3') : c.y('T1');
-      console.log(`${c.b('•')} ${c.b(p.name || p.session_id.slice(0, 8))}  ${c.c(`[${W.agentLabel(p.agent)}]`)}  ${tier}  ${c.dim(`${p.status} ${D.ago(Date.now() - p.last_seen)}`)}`);
-      if (p.intent || d?.intent) console.log(`  ${p.intent || d.intent}`);
+      const alias = p.alias && p.alias !== p.name ? c.dim(` aka ${p.alias}`) : '';
+      console.log(`${c.b('•')} ${c.b(p.name || p.session_id.slice(0, 8))}${alias}  ${c.c(`[${W.agentLabel(p.agent)}]`)}  ${tier}  ${c.dim(`${p.status} ${D.ago(Date.now() - p.last_seen)}`)}`);
+      const desc = D.describe(p, d);
+      if (desc) console.log(`  ${D.truncate(D.collapse(desc), 90)}`);
       if (claims.length) {
         const prov = claims.every(x => x.observed) ? 'observed' : 'self-declared';
         console.log(`  ${c.dim(`editing (${prov}):`)} ${claims.slice(0, 5).map(x => D.relTo(workspace, x.path)).join(', ')}`);
@@ -167,6 +172,11 @@ function doctor() {
   const store = new Store(W.storePath(workspace));
   line('store writable', store.ok, store.ok ? '' : store.error?.message);
   if (!store.ok) problems++;
+  // A silently-empty store looks identical to a healthy one, so say it loudly.
+  store._all('SELECT session_id, slot, synthetic FROM sessions LIMIT 1');
+  line('schema up to date', !store.schemaError, store.schemaError || '');
+  if (store.schemaError) { problems++; console.log(`    ${c.y('run `switchboard purge` to rebuild the store')}`); }
+  if (store.migrated?.length) console.log(`  ${c.g('✓')} ${pad('migrated this run', 32)} ${c.dim(store.migrated.join(', '))}`);
 
   console.log(`\n${c.b('Agent configuration')}`);
   const items = I.plan(workspace, { all: true });
@@ -229,6 +239,89 @@ function purge() {
     fs.rmSync(W.storeDir(workspace), { recursive: true, force: true });
     console.log(`${c.g('✓')} removed ${rel(W.storeDir(workspace))}`);
   } catch (e) { console.log(c.r(`purge failed: ${e.message}`)); }
+}
+
+// ---- sbs: the arrow-key picker ---------------------------------------------
+
+// Browse with arrows, hit enter, then start your session. The whole browse
+// costs ZERO tokens because it happens in the terminal — the model only ever
+// sees the ONE session you chose, injected at SessionStart.
+function sbs() {
+  const store = new Store(W.storePath(workspace));
+  if (!store.ok) return console.log(c.r('store unavailable — run `switchboard init` first'));
+  C.sweep(store, workspace);
+
+  const idx = C.sessionIndex(store, workspace, null, { maxTokens: 8000, all: has('all') });
+  if (!idx.sessions.length) {
+    console.log(c.y(idx.endedCount ? 'No sessions are live in this workspace.' : 'No sessions recorded in this workspace yet.'));
+    console.log(c.dim(idx.endedCount
+      ? `${idx.endedCount} ended session(s) can still be continued: switchboard sbs --all`
+      : 'Start a session here first, then come back.'));
+    return store.close();
+  }
+
+  // Direct selection: `switchboard sbs 2` (list position) or a name. No UI, so
+  // selecting never depends on having a raw-mode terminal.
+  const arg = argv[1] && !argv[1].startsWith('--') ? argv[1] : null;
+  if (arg) {
+    const n = Number(arg);
+    const chosen = (Number.isInteger(n) && n >= 1 && n <= idx.sessions.length)
+      ? idx.sessions[n - 1]
+      : C.findTarget(store, workspace, arg, null);
+    if (!chosen) {
+      console.log(c.y(`No session matches "${arg}".`));
+      console.log(c.dim('Run `switchboard sessions` to see them, or `switchboard sbs` to pick.'));
+      return store.close();
+    }
+    return select(chosen);
+  }
+
+  const ctx = {
+    workspace,
+    claimsBySession: Object.fromEntries(idx.sessions.map(s => [s.session_id, store.claimsFor(s.session_id)])),
+    digestBySession: Object.fromEntries(idx.sessions.map(s => [s.session_id, store.getDigest(s.session_id)])),
+  };
+
+  require('../src/picker').pick(idx.sessions, ctx).then(chosen => {
+    if (!chosen) {
+      console.log(c.dim('cancelled — nothing queued'));
+      return store.close();
+    }
+    select(chosen);
+  });
+
+  function select(chosen) {
+    const nm = chosen.name || chosen.session_id.slice(0, 8);
+    const handle = nm;
+    store.queueAttach({
+      workspace, target_id: chosen.session_id, target_name: nm,
+      ttlMs: 15 * 60_000, adopt: has('adopt') && !chosen.live ? 1 : 0,
+    });
+    console.log(`${c.g('✓')} selected ${c.b(handle)}${handle === nm ? '' : c.dim(` (${nm})`)}` +
+      `  ${c.dim(chosen.live ? 'live' : 'ended')}`);
+    console.log(c.dim(`  its full context will load into the next session started here`));
+    store.close();
+
+    if (has('run')) {
+      console.log(c.dim('  launching claude...\n'));
+      require('child_process').spawn('claude', [], { stdio: 'inherit', cwd: process.cwd() })
+        .on('error', () => console.log(c.y('  could not launch `claude` — start it yourself')));
+    } else {
+      console.log(`\n  Now run:  ${c.b('claude')}`);
+      console.log(c.dim('  (or: switchboard sbs --run  to pick and launch in one step)'));
+    }
+  }
+}
+
+// ---- sessions (the index) --------------------------------------------------
+
+// The terminal equivalent of bare /sbs: every session, live and ended.
+function sessions() {
+  const store = new Store(W.storePath(workspace));
+  if (!store.ok) return console.log(c.r('store unavailable — run `switchboard init` first'));
+  C.sweep(store, workspace);
+  console.log(C.sessionIndex(store, workspace, null, { maxTokens: 8000, all: has('all') }).body);
+  store.close();
 }
 
 // ---- attach ----------------------------------------------------------------
@@ -307,6 +400,29 @@ function attach() {
   }
 }
 
+// ---- ambient token budget --------------------------------------------------
+
+function mode() {
+  const want = argv[1] && !argv[1].startsWith('--') ? argv[1] : null;
+  if (want && !['full', 'lean', 'off'].includes(want)) {
+    console.log(c.y(`Unknown mode "${want}". Use: full | lean | off`));
+    return;
+  }
+  if (want) {
+    C.ensureStoreDir(workspace);
+    C.writeMode(workspace, want);
+    console.log(`${c.g('✓')} ambient mode: ${c.b(want)}`);
+  }
+  const cur = C.readMode(workspace);
+  console.log(`
+  ${cur === 'full' ? c.g('▸') : ' '} ${c.b('full')}  ~150 tok/session   the roster: who is live, what they hold  ${c.dim('(default)')}
+  ${cur === 'lean' ? c.g('▸') : ' '} ${c.b('lean')}   ~18 tok/session   one line; the model pulls only if it cares
+  ${cur === 'off'  ? c.g('▸') : ' '} ${c.b('off')}      0 tok           nothing arrives uninvited
+
+  ${c.dim('These control only what is injected AUTOMATICALLY.')}
+  ${c.dim('sb_peers / @<name> / /sbs / switchboard sbs work the same in every mode.')}`);
+}
+
 // ---- statusline indicator --------------------------------------------------
 
 function statusline() {
@@ -345,6 +461,8 @@ ${c.b('switchboard')} ${c.dim(`v${pkg.version}`)} — ambient shared working mem
 ${c.b('Usage')}
   npx switchboard init [--dry-run] [--all] [--local]
   npx switchboard status [--json] [--raw]
+  npx switchboard sbs [name] [--run] [--all]  # picker, or select by name
+  npx switchboard sessions [--all]            # live sessions (--all adds ended)
   npx switchboard attach [name] [--list] [--adopt] [--cancel]
   npx switchboard board
   npx switchboard doctor
@@ -356,6 +474,7 @@ ${c.b('Flags')}
   --dry-run   show the plan, write nothing
   --all       configure every supported agent, not just detected ones
   --local     point configs at this checkout instead of npx
+  --run       sbs: launch claude immediately after picking
   --list      attach: show sessions without picking
   --adopt     attach: also take over its files (ended sessions only)
   --cancel    attach: clear a queued attach

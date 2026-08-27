@@ -6,6 +6,8 @@
 // text takes a hard cap and honours it. ADR-1: push pointers, pull detail.
 
 const path = require('node:path');
+
+const c_dim = s => s;   // index text is plain; the CLI adds its own colour
 const { DEFAULTS, agentLabel } = require('./workspace');
 
 // ponytail: chars/4 approximation, not a real tokenizer. Within ~10% for
@@ -92,7 +94,8 @@ function renderPeer(peer, claims, digest, workspace, opts = {}) {
   const agent = opts.showAgent === false ? '' : ` [${agentLabel(peer.agent)}]`;
   const intent = peer.intent || digest?.intent || '';
 
-  const lines = [`• ${name}${agent} — ${status}${intent ? ` — ${intent}` : ''}`];
+  const lines = [`• ${name}${agent} — ${status}`];
+  if (intent) lines.push(`  ${truncate(collapse(intent), 90)}`);
 
   if (claims && claims.length) {
     const observed = claims.every(c => c.observed);
@@ -119,7 +122,8 @@ function renderRoster(peers, ctx, opts = {}) {
 
   const header = `[switchboard] ${peers.length} live session${peers.length === 1 ? '' : 's'} in this workspace:`;
   const footer =
-    'Use sb_session(name) for detail, sb_search(q) to check prior work.\n' +
+    'Reference a session by name in a prompt, e.g. @' + (peers[0].name || 'session-name') + '.\n' +
+    'Run /sbs to pick one and continue its work · sb_search(q) for prior findings.\n' +
     'Files above are claimed by other sessions — check before editing.';
 
   // FR-3.2: recency-ordered, oldest truncated first.
@@ -211,6 +215,76 @@ function renderRosterFile(peers, ctx) {
   return `${head.join('\n')}${body.join('\n')}`;
 }
 
+// ---- the index: every session in this workspace ---------------------------
+
+// What bare `/sbs` and `@sbs` produce. Deliberately shows LIVE and ENDED
+// together: "continue what that session was doing before I closed it" is a
+// primary use, and a directory that hides half its entries is worse than none.
+//
+// This is the answer to "is the numbering right?" — you look, then act.
+function renderSessionIndex(sessions, ctx = {}, opts = {}) {
+  const cap = opts.maxTokens ?? 1500;
+  const workspace = ctx.workspace;
+  if (!sessions || !sessions.length) {
+    // Never silently imply "nothing here" when ended sessions exist.
+    return ctx.endedCount
+      ? `[switchboard] No sessions are live in this workspace.\n` +
+        `${ctx.endedCount} ended session${ctx.endedCount === 1 ? '' : 's'} can still be continued — pass --all to see them.`
+      : '[switchboard] No sessions recorded in this workspace yet.';
+  }
+
+  const live = sessions.filter(s => s.live);
+  const ended = sessions.filter(s => !s.live);
+  const hidden = !ctx.all && ctx.endedCount ? ctx.endedCount : 0;
+  const L = [`[switchboard] ${live.length} live session${live.length === 1 ? '' : 's'} in this workspace` +
+             (ended.length ? `, ${ended.length} ended` : '') +
+             (hidden ? ` (${hidden} ended hidden — --all to show)` : '') + ':'];
+
+  const row = s => {
+    const name = s.name || s.session_id.slice(0, 8);
+    const claims = ctx.claimsBySession?.[s.session_id] || [];
+    const d = ctx.digestBySession?.[s.session_id];
+    // The name IS the address. Nothing else identifies a session.
+    const alias = s.alias && s.alias !== name ? `  aka ${s.alias}` : '';
+    const out = [`  ${name}${alias}  [${agentLabel(s.agent)}]  ${s.live ? s.status : 'ended'} ${ago(Date.now() - s.last_seen)}`];
+    const intent = describe(s, d);
+    if (intent) out.push(`        ${truncate(collapse(intent), 88)}`);
+    if (claims.length) out.push(`        files: ${claims.slice(0, 3).map(c => relTo(workspace, c.path)).join(', ')}`);
+    else if (d?.files?.length) out.push(`        files: ${d.files.slice(-3).join(', ')}`);
+    return out.join('\n');
+  };
+
+  if (live.length) { L.push('', ...(ended.length ? ['LIVE:'] : [])); for (const s of live) L.push(row(s)); }
+  if (ended.length) { L.push('', 'ENDED (still attachable):'); for (const s of ended) L.push(row(s)); }
+
+  L.push('');
+  L.push('Reference a session in a prompt with @<name>, e.g. @' + (sessions[0].name || 'session-name') + '.');
+  L.push('Run /sbs to pick one and continue its work.');
+  return capText(L.join('\n'), cap);
+}
+
+// ---- @mention: one session's detail ---------------------------------------
+
+// Middle weight, between the roster line and a full attach. Mentioning a
+// session means "tell me about this one", not "I am taking over its work", so
+// it gets detail without the takeover framing or the takeover budget.
+function renderSessionDetail({ session, digest, claims, notes, workspace }, opts = {}) {
+  const cap = opts.maxTokens ?? 800;
+  const name = session.name || session.session_id.slice(0, 8);
+  const L = [];
+  L.push(`${name} [${agentLabel(session.agent)}] · ${session.live === false ? 'ended' : session.status} ${ago(Date.now() - session.last_seen)}`);
+  if (session.intent || digest?.intent) L.push(`Working on: ${session.intent || digest.intent}`);
+  if (digest?.last_msg) L.push(`Latest: ${digest.last_msg}`);
+  if (claims?.length) {
+    const prov = claims.every(c => c.observed) ? 'observed' : 'self-declared';
+    L.push(`Files it has open (${prov}): ${claims.slice(0, 10).map(c => relTo(workspace, c.path)).join(', ')}`);
+  }
+  if (digest?.files?.length) L.push(`Files touched: ${digest.files.slice(-15).join(', ')}`);
+  if (digest?.commands?.length) L.push(`Recent commands: ${digest.commands.slice(-5).map(c => `\`${c}\``).join(', ')}`);
+  if (notes?.length) L.push(`Findings: ${notes.slice(0, 4).map(n => n.text).join(' · ')}`);
+  return capText(L.join('\n'), cap);
+}
+
 // ---- attach: full context transfer ----------------------------------------
 
 // The roster is deliberately thin (ADR-1: pointers, not payload). Attach is the
@@ -223,7 +297,7 @@ function renderAttachContext({ session, digest, claims, notes, workspace }, opts
   const state = session.live ? `still running` : `ended ${ago(Date.now() - session.last_seen)}`;
 
   const L = [];
-  L.push(`You are continuing the work of session "${name}" [${agentLabel(session.agent)}] (${state}).`);
+  L.push(`You are continuing the work of "${name}" [${agentLabel(session.agent)}] (${state}).`);
   L.push('');
   if (session.intent || digest?.intent) L.push(`WHAT IT WAS DOING: ${session.intent || digest.intent}`);
   if (digest?.last_msg) L.push(`WHERE IT GOT TO: ${digest.last_msg}`);
@@ -264,6 +338,12 @@ function renderAttachContext({ session, digest, claims, notes, workspace }, opts
   return capText(L.join('\n'), cap);
 }
 
+// The session's one-line description: what it is for. Falls back through the
+// stated intent, the digest's intent, then its latest reported finding.
+function describe(session, digest) {
+  return session?.intent || digest?.intent || digest?.last_msg || null;
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 function relTo(workspace, p) {
@@ -289,7 +369,7 @@ function capText(s, maxTokens) {
 function uniq(a) { return [...new Set(a.filter(Boolean))]; }
 
 module.exports = {
-  estimateTokens, redact, buildDigest, ago,
-  renderRoster, renderPeer, renderRosterFile, renderCollisionWarning, renderAttachContext,
+  estimateTokens, redact, buildDigest, ago, describe,
+  renderRoster, renderPeer, renderRosterFile, renderCollisionWarning, renderAttachContext, renderSessionDetail, renderSessionIndex,
   wrapForInjection, fmtAge, relTo, truncate, collapse, capText,
 };

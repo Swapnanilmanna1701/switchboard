@@ -160,6 +160,7 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
   const synthetic = r.session_id ? 0 : fallback.synthetic;
 
   let out = null;
+  let notice = null;      // user-visible confirmation, shown by the agent
 
   try {
     switch (ev) {
@@ -168,6 +169,7 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
         C.registerSession(store, {
           session_id: sessionId, cwd, workspace: ws, agent,
           name: nameFor(agent, sessionId, ws, agentPid),
+          alias: nameFor(agent, sessionId, ws, agentPid),   // the agent's own name
           tier: 3,                       // hooks present ⇒ T3 (store max()'s it)
           synthetic,
           agent_pid: agentPid, status: 'active',
@@ -205,9 +207,47 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
             session_id: sessionId, cwd, workspace: ws, agent, agent_pid: agentPid,
             intent: D.truncate(D.collapse(r.prompt), 200),
           });
+          // Now that we know what this session is FOR, give it a real name.
+          C.nameFromWork(store, sessionId, ws, { intent: r.prompt });
+          C.writeRoster(store, ws);
         } else {
           store.touch(sessionId, 'active');
         }
+        // @mentions win over everything else on this turn: the user explicitly
+        // pointed at a session, so answer that rather than a generic delta.
+        // Unresolvable tags inject nothing, so an email address or a decorator
+        // in pasted code is never mistaken for a session reference.
+        const men = C.mentionText(store, ws, r.prompt, sessionId);
+        if (men.cleared !== undefined) {
+          notice = `${BLUE}[switchboard]${RESET} stopped referencing ` +
+            `${men.cleared} session${men.cleared === 1 ? '' : 's'}`;
+          break;
+        }
+        if (men.text) {
+          store.event('mention', { session_id: sessionId, workspace: ws,
+            tokens: men.tokens, detail: men.tags.join(',') });
+          // A tagged session stays REFERENCED from now on.
+          if (men.hits?.length) {
+            C.rememberRefs(store, ws, sessionId, men.hits);
+            notice = refNotice(men.hits);
+          } else if (men.index) {
+            notice = `${BLUE}[switchboard]${RESET} listing sessions`;
+          }
+          out = men.text;
+          break;
+        }
+
+        // Nothing tagged this turn: feed whatever the referenced sessions have
+        // done since we last reported. Silent when nothing changed.
+        const delta = C.refDelta(store, ws, sessionId);
+        if (delta.text) {
+          store.event('refdelta', { session_id: sessionId, workspace: ws, tokens: delta.tokens });
+          out = delta.text;
+          notice = `${BLUE}[switchboard]${RESET} update from ` +
+            delta.changed.map(c => c.target.name || '?').join(', ');
+          break;
+        }
+
         // FR-3.7 / V1 delta injection, rate-limited to at most 1 in 5 turns.
         if (shouldInjectDelta(store, ws, sessionId)) {
           const inj = C.injectionText(store, ws, sessionId, { maxTokens: 150 });
@@ -246,6 +286,7 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
             store.addClaim({ path: abs, session_id: sessionId, workspace: ws,
               ttlMs: W.DEFAULTS.claimTtlMs, op: 'edit', observed: 1 });
             recordActivity(store, sessionId, ws, { file: abs });
+            C.nameFromWork(store, sessionId, ws, { files: [abs] });
             C.writeRoster(store, ws);
           }
         } else if (SHELL_TOOLS.test(tool)) {
@@ -298,7 +339,17 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
     try { store.close(); } catch { /* ignore */ }
   }
 
-  return { output: out, dialect, event: ev, rawEvent };
+  return { output: out, dialect, event: ev, rawEvent, notice };
+}
+
+// Blue, to match the [SWITCHBOARD] badge in the status line.
+const BLUE = '\x1b[38;5;111m';
+const RESET = '\x1b[0m';
+
+function refNotice(hits) {
+  const names = hits.map(({ session }) => session.name || session.session_id.slice(0, 8));
+  return `${BLUE}[switchboard]${RESET} referencing ${names.join(', ')} ` +
+         `${BLUE}(active until you clear it)${RESET}`;
 }
 
 // At most one delta injection per 5 turns (§10.10 hard caps).
@@ -326,13 +377,16 @@ function nameFor(agent, sessionId, ws, agentPid) {
 function run({ input, agent, event, stdout = process.stdout }) {
   let raw = {};
   try { raw = JSON.parse(input || '{}'); } catch { raw = {}; }
-  const { output, dialect } = handle(raw, { agent, eventOverride: event });
-  if (!output) return 0;
+  const { output, dialect, notice } = handle(raw, { agent, eventOverride: event });
+  if (!output && !notice) return 0;
 
   const evName = raw.hook_event_name || event || '';
-  const payload = dialect.emit(evName, output);
-  if (payload) stdout.write(`${JSON.stringify(payload)}\n`);
-  else if (dialect.alsoStdout) stdout.write(`${output}\n`);
+  const payload = output ? dialect.emit(evName, output) : {};
+  // `systemMessage` is shown to the USER, not the model — that is what makes a
+  // resolved @tag visibly acknowledged rather than silently absorbed.
+  if (notice) (payload || {}).systemMessage = notice;
+  if (payload && Object.keys(payload).length) stdout.write(`${JSON.stringify(payload)}\n`);
+  else if (output && dialect.alsoStdout) stdout.write(`${output}\n`);
   return 0;
 }
 

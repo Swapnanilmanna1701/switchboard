@@ -14,7 +14,8 @@ const HOME = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
 
 const DEFAULTS = {
-  liveTtlMs:      120_000,   // FR-2.2
+  liveTtlMs:      120_000,   // FR-2.2 — fallback only, when we have no pid
+  staleMs:        12 * 3600_000, // pid alive but untouched this long => treat as gone
   claimTtlMs:     900_000,   // 15 min — §17 open question 3
   maxDigestTokens:      500, // FR-3.2 hard cap
   maxPeerTokens:         80, // §10.10

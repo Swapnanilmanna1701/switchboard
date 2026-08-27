@@ -18,21 +18,67 @@ npx switchboard init
 1. **Cold-start priming** — a new session opens already knowing what the other live sessions are doing.
 2. **Collision guard** — a session is warned *before* editing a file another session has claimed.
 3. **Shared findings** — one session posts a root cause; every later session can find it.
+4. **Attach** — pick any session, live or ended, and continue its work with its full context.
 
 A fresh session receives this, automatically, at startup:
 
 ```
 [switchboard] 2 live sessions in this workspace:
 
-• api-3f9a [Claude Code] — idle 4m — debugging login 500s
+• debug-login-500-errors (sbs1) [Claude Code] — idle 4m
+  debugging the login 500 errors
   editing: middleware/session.ts
   latest: root cause: exp claim compared in ms not seconds
 
-• ui-b2c1 [Cursor] — active just now
+• restyle-checkout-form (sbs2) [Cursor] — active just now
   editing: components/Checkout.tsx
 
-Use sb_session(name) for detail, sb_search(q) to check prior work.
+Refer to a session by its short handle: type @sbs1 to pull it into context,
+or /sbs1 to continue its work.
 ```
+
+Sessions name themselves from what they're doing — mechanically, no LLM call —
+and keep that name for life. `sbs1` is just a short alias for typing.
+
+## Continue another session's work
+
+```bash
+switchboard sbs                  # arrow-key picker — browsing costs 0 tokens
+switchboard sbs 2                # or select directly by number,
+switchboard sbs debug-login-500-errors   # by name,
+switchboard sbs sbs1             # or by handle
+claude                           # that session's full context loads here
+```
+
+The picker lists **live and ended** sessions — continuing work from a session
+you already closed is the most valuable case, so it is not hidden.
+
+```
+  switchboard  ~/work/api
+  3 sessions · 2 live · 1 ended
+
+▶ debug-login-500-errors  sbs1  [Claude Code]  live   4m
+       debugging the login 500 errors
+       middleware/session.ts
+
+  restyle-checkout-form   sbs2  [Cursor]       live   just now
+  migrate-content-schema  sbs3  [Claude Code]  ended  2h
+
+  ↑/↓ move · enter select · q or esc cancel
+```
+
+## Reference a session mid-conversation
+
+| You type | You get | Cost |
+|---|---|---|
+| *(nothing)* | ambient roster at session start | ~500 tok |
+| `@sbs` or `/sbs` | every session, live and ended | ~300 tok |
+| `@sbs1` / `@<name>` | that session's detail | ~800 tok |
+| `/sbs1` | take over its work, full context | ~3000 tok |
+| `switchboard sbs` | the picker | **0 tok** |
+
+An `@tag` that matches no session injects **nothing** — an email address or a
+`@decorator` in pasted code never triggers a false injection.
 
 ## Works with
 
@@ -74,6 +120,7 @@ exactly what it changed, and `uninstall` reverses all of it.
 | `sb_search(query)` | "Has anyone already tried this?" across notes and activity |
 | `sb_note(text)` | Post a finding for current and future sessions |
 | `sb_claim(paths)` | Reserve files before a refactor |
+| `sb_attach(name)` | Take over a session's work with its entire recorded context |
 | `sb_handoff(target)` | Compose a context handoff for another session |
 
 ## How it works
@@ -118,7 +165,7 @@ Node ≥ 22 (for `node:sqlite`). macOS, Linux, WSL2. Zero runtime dependencies.
 ## Development
 
 ```bash
-node test/test.js        # 83 checks, no framework
+node test/test.js        # 167 checks, no framework
 ```
 
 ## Docs

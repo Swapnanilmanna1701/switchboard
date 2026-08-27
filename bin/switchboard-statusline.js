@@ -60,25 +60,13 @@ function runChained(raw) {
   } catch { return ''; }         // a broken chain must not hide our own tag
 }
 
-// Active = switchboard is configured for this workspace. Shows the live peer
-// count when there is one, mirroring ponytail's [PONYTAIL:MODE] shape.
+// Active = switchboard is configured for this workspace. Just the badge —
+// a status line is a presence indicator, not a dashboard. Live counts and
+// handles change constantly and would make it flicker; `switchboard sessions`
+// answers "who else is here" properly, on demand.
 function switchboardTag(cwd) {
-  const ws = findWorkspace(cwd);
-  if (!ws) return '';
-
-  let peers = 0;
-  try {
-    const { Store } = require('../src/store');
-    const W = require('../src/workspace');
-    const store = new Store(W.storePath(ws));
-    if (store.ok) {
-      peers = store.livePeers(ws, null, W.DEFAULTS.liveTtlMs).length;
-      store.close();
-    }
-  } catch { /* store optional — the tag still shows */ }
-
-  const label = peers > 0 ? `[SWITCHBOARD:${peers}]` : '[SWITCHBOARD]';
-  return `\x1b[38;5;${COLOR}m${label}\x1b[0m`;
+  if (!findWorkspace(cwd)) return '';
+  return `\x1b[38;5;${COLOR}m[SWITCHBOARD]\x1b[0m`;
 }
 
 // Walk up looking for a workspace switchboard is actually installed in.

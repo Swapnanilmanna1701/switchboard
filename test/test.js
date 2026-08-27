@@ -18,10 +18,17 @@ const { McpServer } = require('../src/mcp');
 let pass = 0, fail = 0;
 const only = process.argv[2];
 
+const pending = [];
 function test(name, fn) {
   if (only && !name.includes(only)) return;
-  try { fn(); pass++; console.log(`  \x1b[32m✓\x1b[0m ${name}`); }
-  catch (e) { fail++; console.log(`  \x1b[31m✗\x1b[0m ${name}\n     ${e.message}`); }
+  const okMsg = () => { pass++; console.log(`  \x1b[32m✓\x1b[0m ${name}`); };
+  const errMsg = e => { fail++; console.log(`  \x1b[31m✗\x1b[0m ${name}\n     ${e.message}`); };
+  try {
+    const r = fn();
+    // Async tests (the picker) resolve later; collect them and await at the end.
+    if (r && typeof r.then === 'function') pending.push(r.then(okMsg, errMsg));
+    else okMsg();
+  } catch (e) { errMsg(e); }
 }
 function group(n) { console.log(`\n\x1b[1m${n}\x1b[0m`); }
 
@@ -66,6 +73,14 @@ function freshStore(name) {
 }
 const DEAD_PID = 999_999;   // reliably not a live process
 
+// Sessions are addressed by NAME now; tests need the name the hook derived.
+function nameOf(ws, id) {
+  const st = new Store(W.storePath(ws));
+  const n = st.getSession(id)?.name;
+  st.close();
+  return n;
+}
+
 // ---------------------------------------------------------------- store ----
 group('store');
 
@@ -73,6 +88,45 @@ test('opens, creates schema, enables FTS5', () => {
   const { store } = freshStore('s1');
   assert.ok(store.ok, 'store should open');
   assert.ok(store.fts, 'FTS5 expected on node >= 22');
+  store.close();
+});
+
+test('migrates an OLD database instead of silently returning nothing', () => {
+  // Regression, found in a real install: `CREATE TABLE IF NOT EXISTS` does not
+  // alter an existing table. After a new column shipped, every write threw,
+  // fail-open swallowed it, and the product reported "no sessions" while
+  // looking perfectly healthy. Migration must repair that on open.
+  const ws = tmpWs('mig1');
+  const dbPath = path.join(ws, '.switchboard', 'state.db');
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+  const { DatabaseSync } = require('node:sqlite');
+  const old = new DatabaseSync(dbPath);
+  old.exec(`CREATE TABLE sessions (
+    session_id TEXT PRIMARY KEY, link_key TEXT, pid INTEGER, agent_pid INTEGER,
+    name TEXT, agent TEXT, agent_ver TEXT, tier INTEGER, cwd TEXT, workspace TEXT,
+    started_at INTEGER, last_seen INTEGER, status TEXT, intent TEXT)`);   // v1: no slot, no synthetic
+  old.prepare('INSERT INTO sessions(session_id,workspace,status,last_seen,agent_pid) VALUES(?,?,?,?,?)')
+    .run('legacy', ws, 'active', Date.now(), process.pid);
+  old.close();
+
+  const store = new Store(dbPath);
+  assert.ok(store.ok);
+  assert.ok((store.migrated || []).includes('sessions.synthetic'), 'synthetic must be added');
+  assert.ok((store.migrated || []).includes('sessions.alias'), 'alias must be added');
+
+  // The pre-existing row survives, and new writes work.
+  assert.ok(store.getSession('legacy'), 'existing data preserved');
+  store.upsertSession({ session_id: 'fresh', workspace: ws, agent_pid: process.pid, agent: 'claude-code' });
+  assert.ok(store.getSession('fresh'), 'writes work after migration');
+  assert.equal(store.schemaError, undefined, 'no schema errors left');
+  store.close();
+});
+
+test('schema drift is recorded, not swallowed into a silent lie', () => {
+  const { store } = freshStore('mig2');
+  store._all('SELECT column_that_does_not_exist FROM sessions');
+  assert.ok(store.schemaError, 'a missing column must be visible to doctor');
   store.close();
 });
 
@@ -150,6 +204,36 @@ test('a real id never reverts to synthetic on a later partial write', () => {
   store.upsertSession({ session_id: 'x', workspace: ws, agent_pid: process.pid, synthetic: 0 });
   store.upsertSession({ session_id: 'x', workspace: ws, agent_pid: process.pid, synthetic: 1 });
   assert.equal(store.getSession('x').synthetic, 0);
+  store.close();
+});
+
+test('an IDLE but alive session stays visible — hooks only fire when you act', () => {
+  // Regression: liveness required a heartbeat within 120s. Hooks fire only on
+  // activity, so a session you were simply reading in vanished from the roster
+  // after two minutes and lost its sbs handle to the next session that started.
+  const { store, ws } = freshStore('live1');
+  store.upsertSession({ session_id: 'idle', workspace: ws, agent_pid: process.pid, agent: 'claude-code' });
+  store._run('UPDATE sessions SET last_seen=? WHERE session_id=?', Date.now() - 45 * 60_000, 'idle');
+
+  const peers = store.livePeers(ws, null, W.DEFAULTS.liveTtlMs);
+  assert.equal(peers.length, 1, '45 minutes idle with a live process is still live');
+  assert.equal(store.reap(W.DEFAULTS.liveTtlMs), 0, 'and must not be reaped');
+  store.close();
+});
+
+test('a dead process is gone immediately, whatever the heartbeat says', () => {
+  const { store, ws } = freshStore('live3');
+  store.upsertSession({ session_id: 'dead', workspace: ws, agent_pid: DEAD_PID });
+  assert.equal(store.livePeers(ws, null, W.DEFAULTS.liveTtlMs).length, 0);
+  store.close();
+});
+
+test('a very old row is dropped even if its pid got recycled', () => {
+  const { store, ws } = freshStore('live4');
+  store.upsertSession({ session_id: 'ancient', workspace: ws, agent_pid: process.pid });
+  store._run('UPDATE sessions SET last_seen=? WHERE session_id=?', Date.now() - 48 * 3600_000, 'ancient');
+  assert.equal(store.livePeers(ws, null, W.DEFAULTS.liveTtlMs).length, 0,
+    'staleness bound guards against pid reuse');
   store.close();
 });
 
@@ -422,6 +506,10 @@ test('roster file states plainly when nobody is live', () => {
 // ------------------------------------------------------------------ mcp ----
 group('mcp server (the universal substrate)');
 
+// Tool calls resolve on a microtask now (elicitation can await the user), so
+// tests must let the reply land before asserting.
+const flush = () => new Promise(r => setImmediate(r));
+
 function mcpHarness(ws) {
   const sent = [];
   const stdout = { write: s => { sent.push(JSON.parse(s)); return true; } };
@@ -450,7 +538,7 @@ test('tools/list exposes every documented tool with a usable schema', () => {
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex' } } });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = sent[1].result.tools.map(t => t.name).sort();
-  assert.deepEqual(names, ['sb_attach', 'sb_claim', 'sb_handoff', 'sb_note', 'sb_peers', 'sb_search', 'sb_session']);
+  assert.deepEqual(names, ['sb_attach', 'sb_claim', 'sb_handoff', 'sb_note', 'sb_peers', 'sb_pick', 'sb_search', 'sb_session']);
   for (const t of sent[1].result.tools) {
     assert.ok(t.description.length > 40, `${t.name} needs a usable description`);
     assert.equal(t.inputSchema.type, 'object');
@@ -458,27 +546,30 @@ test('tools/list exposes every documented tool with a usable schema', () => {
   srv.shutdown();
 });
 
-test('sb_note then sb_search round-trips a finding', () => {
+test('sb_note then sb_search round-trips a finding', async () => {
   const ws = tmpWs('mcp3');
   const { srv, sent, send } = mcpHarness(ws);
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-code' } } });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_note', arguments: { text: 'exp claim compared in ms not seconds' } } });
+  await flush();
   send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'sb_search', arguments: { query: 'seconds' } } });
+  await flush();
   assert.ok(sent[2].result.content[0].text.includes('exp claim'));
   srv.shutdown();
 });
 
-test('sb_note redacts a secret before it can cross sessions', () => {
+test('sb_note redacts a secret before it can cross sessions', async () => {
   const ws = tmpWs('mcp4');
   const { srv, sent, send } = mcpHarness(ws);
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-code' } } });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_note', arguments: { text: 'use sk-abcdefghijklmnopqrstuv to auth' } } });
+  await flush();
   const stored = srv.ctx.store.recentNotes(srv.ctx.workspace)[0].text;
   assert.ok(!stored.includes('sk-abcdefghijklmnopqrstuv'));
   srv.shutdown();
 });
 
-test('sb_claim records a self-declared claim and reports conflicts', () => {
+test('sb_claim records a self-declared claim and reports conflicts', async () => {
   const ws = tmpWs('mcp5');
   const { srv, sent, send } = mcpHarness(ws);
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex' } } });
@@ -486,6 +577,7 @@ test('sb_claim records a self-declared claim and reports conflicts', () => {
   srv.ctx.store.upsertSession({ session_id: 'peer', workspace: srv.ctx.workspace, agent_pid: process.pid, name: 'other' });
   srv.ctx.store.addClaim({ path: path.join(srv.ctx.workspace, 'a.ts'), session_id: 'peer', workspace: srv.ctx.workspace, ttlMs: 60000, observed: 1 });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_claim', arguments: { paths: ['a.ts'], reason: 'refactor' } } });
+  await flush();
   const out = sent[1].result.content[0].text;
   assert.ok(out.includes('Claimed 1 file'));
   assert.ok(out.includes('other'), 'must warn about the existing claim');
@@ -494,51 +586,57 @@ test('sb_claim records a self-declared claim and reports conflicts', () => {
   srv.shutdown();
 });
 
-test('sb_peers reports emptiness honestly, then lists a peer', () => {
+test('sb_peers reports emptiness honestly, then lists a peer', async () => {
   const ws = tmpWs('mcp6');
   const { srv, sent, send } = mcpHarness(ws);
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-code' } } });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_peers', arguments: {} } });
+  await flush();
   assert.ok(sent[1].result.content[0].text.includes('No other sessions'));
   srv.ctx.store.upsertSession({ session_id: 'peer', workspace: srv.ctx.workspace, agent_pid: process.pid, name: 'tests', agent: 'cursor' });
   send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'sb_peers', arguments: {} } });
+  await flush();
   assert.ok(sent[2].result.content[0].text.includes('tests'));
   srv.shutdown();
 });
 
-test('sb_session returns detail, and fails helpfully on a bad name', () => {
+test('sb_session returns detail, and fails helpfully on a bad name', async () => {
   const ws = tmpWs('mcp7');
   const { srv, sent, send } = mcpHarness(ws);
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-code' } } });
   srv.ctx.store.upsertSession({ session_id: 'peer', workspace: srv.ctx.workspace, agent_pid: process.pid, name: 'auth-fix', agent: 'cursor', intent: 'login 500s' });
   srv.ctx.store.putDigest({ session_id: 'peer', workspace: srv.ctx.workspace, files: ['src/a.ts'], commands: ['npm test'], last_msg: 'found it' });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_session', arguments: { name: 'auth-fix' } } });
+  await flush();
   const t = sent[1].result.content[0].text;
   assert.ok(t.includes('login 500s') && t.includes('src/a.ts') && t.includes('npm test') && t.includes('found it'));
   send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'sb_session', arguments: { name: 'nope' } } });
-  assert.ok(sent[2].result.content[0].text.includes('No live session named'));
+  await flush();
+  assert.ok(sent[2].result.content[0].text.includes('No session named'));
   srv.shutdown();
 });
 
-test('sb_handoff composes a message for the platform to deliver (ADR-6)', () => {
+test('sb_handoff composes a message for the platform to deliver (ADR-6)', async () => {
   const ws = tmpWs('mcp8');
   const { srv, sent, send } = mcpHarness(ws);
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-code' } } });
   srv.ctx.store.upsertSession({ session_id: srv.sessionId, workspace: srv.ctx.workspace, intent: 'fixing auth', agent_pid: process.pid });
   srv.ctx.store.putDigest({ session_id: srv.sessionId, workspace: srv.ctx.workspace, files: [], commands: [], last_msg: 'exp in ms' });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_handoff', arguments: { target: 'ui', scope: 'auth only' } } });
+  await flush();
   const t = sent[1].result.content[0].text;
   assert.ok(t.includes('SendMessage') && t.includes('fixing auth') && t.includes('auth only'));
   srv.shutdown();
 });
 
-test('unknown method and unknown tool return JSON-RPC errors, not crashes', () => {
+test('unknown method and unknown tool return JSON-RPC errors, not crashes', async () => {
   const ws = tmpWs('mcp9');
   const { srv, sent, send } = mcpHarness(ws);
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'x' } } });
   send({ jsonrpc: '2.0', id: 2, method: 'no/such/method' });
   assert.equal(sent[1].error.code, -32601);
   send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'sb_nope', arguments: {} } });
+  await flush();
   assert.equal(sent[2].error.code, -32602);
   srv.shutdown();
 });
@@ -555,7 +653,7 @@ test('notifications get no reply; ping does', () => {
   srv.shutdown();
 });
 
-test('malformed input never throws', () => {
+test('malformed input never throws', async () => {
   const ws = tmpWs('mcp11');
   const { srv } = mcpHarness(ws);
   assert.doesNotThrow(() => { srv.handleLine('{not json'); srv.handleLine(''); srv.handleLine('null'); });
@@ -820,6 +918,28 @@ test('AGENTS.md stanza is written once, inside markers (ADR-0b, RISK-11)', () =>
   const after = fs.readFileSync(path.join(ws, 'AGENTS.md'), 'utf8');
   assert.ok(!after.includes('switchboard'));
   assert.ok(after.includes('Build with pnpm.'), 'revert must not eat user content');
+});
+
+test('an outdated AGENTS.md stanza is rewritten in place, not skipped', () => {
+  // Regression: `installed()` only checked for the marker, so once a repo had
+  // any stanza, a newer version of the text could never reach it — the repo
+  // silently kept stale instructions.
+  const ws = tmpWs('i18');
+  fs.writeFileSync(path.join(ws, 'AGENTS.md'),
+    `# My project\n\nBuild with pnpm.\n\n${I.MARK_BEGIN}\n## Concurrent sessions\n\nOld outdated text.\n${I.MARK_END}\n\n## Deploy\n\nRun make deploy.\n`);
+  const a = I.agentsMd(ws);
+  assert.equal(a.installed(), false, 'a stale stanza is not "installed"');
+  assert.ok(a.apply(), 'it gets rewritten');
+
+  const body = fs.readFileSync(path.join(ws, 'AGENTS.md'), 'utf8');
+  assert.ok(!body.includes('Old outdated text'), 'stale text gone');
+  assert.ok(body.includes('sb_peers'), 'current text present');
+  assert.equal((body.match(/switchboard:begin/g) || []).length, 1, 'exactly one stanza');
+  assert.ok(body.includes('Build with pnpm.') && body.includes('Run make deploy.'),
+    'content on BOTH sides of the stanza preserved');
+  assert.ok(body.indexOf('Build with pnpm') < body.indexOf('switchboard:begin'), 'position kept');
+  assert.equal(a.installed(), true);
+  assert.equal(a.apply(), null, 'idempotent once current');
 });
 
 test('CLAUDE.md bridge puts @AGENTS.md on the first line (§10.3)', () => {
@@ -1128,18 +1248,107 @@ test('queueing twice replaces rather than stacking', () => {
   store.close();
 });
 
-test('sb_attach works in-session over real MCP', () => {
+test('sb_attach works in-session over real MCP', async () => {
   const { ws, WS } = withSource('at13');
   const sent = [];
   const srv = new McpServer({ cwd: ws, stdout: { write: s => sent.push(JSON.parse(s)) } });
   const send = o => srv.handleLine(JSON.stringify(o));
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex-cli' } } });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_attach', arguments: { name: 'SRC' } } });
+  await flush();
   const t = sent[1].result.content[0].text;
   assert.ok(t.includes('migrate auth to JWT v2') && t.includes('auth/jwt.ts'));
   send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'sb_attach', arguments: { name: 'ghost' } } });
+  await flush();
   assert.ok(sent[2].result.content[0].text.includes('No session matches'));
   srv.shutdown();
+});
+
+test('sb_pick elicits a choice and returns that session\'s context', async () => {
+  const ws = tmpWs('pick-mcp1');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'SRC', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'SRC', cwd: ws, user_input: 'migrate the auth tokens' }, { agent: CC });
+
+  const sent = [];
+  const srv = new McpServer({ cwd: ws, stdout: { write: s2 => sent.push(JSON.parse(s2)) } });
+  const send = o => srv.handleLine(JSON.stringify(o));
+  // The client must ADVERTISE elicitation, exactly as Claude Code does.
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: { clientInfo: { name: 'claude-code' }, capabilities: { elicitation: {} } } });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_pick', arguments: {} } });
+  await flush();
+
+  // The server should now be ASKING the client to show a picker.
+  const ask = sent.find(m => m.method === 'elicitation/create');
+  assert.ok(ask, 'sb_pick must request an interactive choice');
+  const schema = ask.params.requestedSchema.properties.session;
+  assert.ok(Array.isArray(schema.enum) && schema.enum.length >= 1, 'enum renders as a picker');
+  assert.ok(schema.enum.some(n => /migrate-auth-tokens/.test(n)), 'sessions are chosen BY NAME');
+  assert.ok(schema.enumNames.some(n => /migrate-auth-tokens/.test(n)), 'labels show the session name');
+  assert.ok(schema.enumNames.some(n => /live|ended/.test(n)), 'and its state');
+
+  // Answer as the user would.
+  send({ jsonrpc: '2.0', id: ask.id, result: { action: 'accept', content: { session: schema.enum[0] } } });
+  await flush();
+  const reply = sent.find(m => m.id === 2);
+  assert.ok(reply.result.content[0].text.includes('migrate the auth tokens'),
+    'the chosen session\'s full context comes back');
+  srv.shutdown();
+});
+
+test('sb_pick falls back to the printed list when the user declines', async () => {
+  const ws = tmpWs('pick-mcp2');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'SRC', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'SRC', cwd: ws, user_input: 'fix the parser' }, { agent: CC });
+  const sent = [];
+  const srv = new McpServer({ cwd: ws, stdout: { write: s2 => sent.push(JSON.parse(s2)) } });
+  const send = o => srv.handleLine(JSON.stringify(o));
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-code' }, capabilities: { elicitation: {} } } });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_pick', arguments: {} } });
+  await flush();
+  const ask = sent.find(m => m.method === 'elicitation/create');
+  send({ jsonrpc: '2.0', id: ask.id, result: { action: 'decline' } });
+  await flush();
+  const t = sent.find(m => m.id === 2).result.content[0].text;
+  assert.ok(t.includes('No session selected'), 'says so plainly');
+  assert.ok(t.includes('fix-the-parser') || t.includes('fix the parser'), 'still shows the list');
+  srv.shutdown();
+});
+
+test('sb_pick degrades to the plain index when the client cannot elicit', async () => {
+  const ws = tmpWs('pick-mcp3');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'SRC', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'SRC', cwd: ws, user_input: 'tidy the imports' }, { agent: CC });
+  const sent = [];
+  const srv = new McpServer({ cwd: ws, stdout: { write: s2 => sent.push(JSON.parse(s2)) } });
+  const send = o => srv.handleLine(JSON.stringify(o));
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex-cli' }, capabilities: {} } });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_pick', arguments: {} } });
+  await flush();
+  assert.ok(!sent.some(m => m.method === 'elicitation/create'), 'must not elicit where unsupported');
+  const t = sent.find(m => m.id === 2).result.content[0].text;
+  assert.ok(t.includes('tidy') || t.includes('session'), 'the list still arrives');
+  srv.shutdown();
+});
+
+test('a stray response never crashes the server', () => {
+  const ws = tmpWs('pick-mcp4');
+  const srv = new McpServer({ cwd: ws, stdout: { write: () => {} } });
+  assert.doesNotThrow(() => {
+    srv.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 'sb-999', result: {} }));
+    srv.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 'unknown', result: {} }));
+  });
+  srv.shutdown();
+});
+
+test('/sbs runs sb_pick, not a text listing', () => {
+  const ws = tmpWs('pick-cmd');
+  const home = path.join(tmpRoot, 'home-pick');
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  I.apply(ws, { home });
+  const body = fs.readFileSync(path.join(ws, '.claude/commands/sbs.md'), 'utf8');
+  assert.ok(body.includes('sb_pick'), 'the command must invoke the interactive picker');
+  assert.ok(/do NOT print the list\s+yourself/i.test(body), 'the tool does the asking');
 });
 
 test('sb_attach is advertised with a schema', () => {
@@ -1149,15 +1358,750 @@ test('sb_attach is advertised with a schema', () => {
   assert.ok(/continue|take over/i.test(t.description));
 });
 
+// -------------------------------------------------------- @mentions ----
+group('@mention — tag a session in a prompt');
+
+function twoSessions(name) {
+  const ws = tmpWs(name);
+  const WS = W.resolveWorkspace(ws);
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'debug the login 500s' }, { agent: CC });
+  H.handle({ hook_event_name: 'PostToolUse', session_id: 'A', cwd: ws, tool_name: 'Edit', tool_input: { file_path: path.join(ws, 'auth.ts') } }, { agent: CC });
+  H.handle({ hook_event_name: 'Stop', session_id: 'A', cwd: ws, last_assistant_message: 'exp compared in ms not seconds' }, { agent: CC });
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'B', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'B', cwd: ws, user_input: 'write checkout tests' }, { agent: CC });
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'ME', cwd: ws }, { agent: CC });
+  return { ws, WS, store: new Store(W.storePath(ws)) };
+}
+
+test('bare @sbs lists EVERY session — live and ended', () => {
+  const ws = tmpWs('idx1');
+  const WS = W.resolveWorkspace(ws);
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'LIVE', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'LIVE', cwd: ws, user_input: 'fix auth' }, { agent: CC });
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'DEAD', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'DEAD', cwd: ws, user_input: 'old migration work' }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  store.endSession('DEAD');
+  store.close();
+
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'ME', cwd: ws }, { agent: CC });
+  const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: 'show me @sbs' }, { agent: CC }).output;
+
+  assert.ok(out, 'bare @sbs must produce the index');
+  assert.ok(out.includes('fix auth'), 'the live session is listed');
+  assert.ok(!out.includes('old migration work'), 'ended ones are not listed by default');
+  assert.ok(/ended hidden/.test(out), 'but their existence is stated, never silently dropped');
+  assert.ok(out.includes('fix-auth'), 'addressed by name');
+});
+
+test('the index states counts and explains how to act on it', () => {
+  const ws = tmpWs('idx2');
+  const WS = W.resolveWorkspace(ws);
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  const idx = C.sessionIndex(store, WS, null, { all: true });
+  assert.ok(/\d+ live session/.test(idx.body), 'says how many are live');
+  assert.ok(idx.body.includes('@'), 'says how to reference one');
+  assert.ok(idx.body.includes('/sbs'), 'and how to pick one');
+  store.close();
+});
+
+test('pid 1 is never a live agent (reparented to init = gone)', () => {
+  const { store, ws } = freshStore('pid1');
+  store.upsertSession({ session_id: 'orphan', workspace: ws, agent_pid: 1, agent: 'claude-code' });
+  assert.equal(store.livePeers(ws, null, W.DEFAULTS.liveTtlMs).length, 0,
+    'pid 1 means our parent exited; the agent is not running');
+  assert.equal(isPidAlive(1), false);
+  assert.equal(isPidAlive(0), false);
+  store.close();
+});
+
+test('only sessions from THIS workspace ever appear', () => {
+  const { store, ws } = freshStore('scope');
+  store.upsertSession({ session_id: 'mine',    workspace: ws,          agent_pid: process.pid });
+  store.upsertSession({ session_id: 'foreign', workspace: '/other/repo', agent_pid: process.pid });
+  const ids = store.livePeers(ws, null, W.DEFAULTS.liveTtlMs).map(p => p.session_id);
+  assert.deepEqual(ids, ['mine'], 'another repo must never leak in');
+  assert.deepEqual(store.attachCandidates(ws, null, W.DEFAULTS.liveTtlMs).map(p => p.session_id), ['mine']);
+  store.close();
+});
+
+test('the index shows LIVE only, and says how many ended are hidden', () => {
+  const { store, ws } = freshStore('liveonly');
+  store.upsertSession({ session_id: 'live', workspace: ws, agent_pid: process.pid, name: 'still-running', agent: 'claude-code' });
+  store.upsertSession({ session_id: 'gone', workspace: ws, agent_pid: process.pid, name: 'finished-work', agent: 'claude-code' });
+  store.endSession('gone');
+
+  const dflt = C.sessionIndex(store, ws, null);
+  assert.equal(dflt.sessions.length, 1, 'live only by default');
+  assert.ok(dflt.body.includes('still-running'));
+  assert.ok(!dflt.body.includes('finished-work'), 'ended not listed');
+  assert.ok(/1 ended hidden/.test(dflt.body), 'but never silently dropped');
+
+  const all = C.sessionIndex(store, ws, null, { all: true });
+  assert.equal(all.sessions.length, 2, '--all brings ended back');
+  assert.ok(all.body.includes('finished-work'));
+  store.close();
+});
+
+test('when nothing is live it says so, and points at the ended ones', () => {
+  const { store, ws } = freshStore('noneLive');
+  store.upsertSession({ session_id: 'gone', workspace: ws, agent_pid: process.pid, name: 'old-work' });
+  store.endSession('gone');
+  const idx = C.sessionIndex(store, ws, null);
+  assert.equal(idx.sessions.length, 0);
+  assert.ok(/No sessions are live/.test(idx.body));
+  assert.ok(/--all/.test(idx.body), 'tells you how to reach them');
+  store.close();
+});
+
+test('the index is empty-safe', () => {
+  const { store, ws } = freshStore('idx3');
+  assert.ok(C.sessionIndex(store, ws, null).body.includes('No sessions recorded'));
+  store.close();
+});
+
+test('sb_peers({all:true}) returns the same index over MCP', async () => {
+  const ws = tmpWs('idx4');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'refactor api' }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  store.endSession('A');
+  store.close();
+
+  const sent = [];
+  const srv = new McpServer({ cwd: ws, stdout: { write: s => sent.push(JSON.parse(s)) } });
+  const send = o => srv.handleLine(JSON.stringify(o));
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-code' } } });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_peers', arguments: { all: true } } });
+  await flush();
+  const t = sent[1].result.content[0].text;
+  assert.ok(t.includes('refactor api'), 'ended session included');
+  assert.ok(t.includes('ENDED'));
+  srv.shutdown();
+});
+
+test('sb_peers with no live peers still points at attachable ended ones', async () => {
+  const ws = tmpWs('idx5');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'half-finished work' }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  store.endSession('A');
+  store.close();
+
+  const sent = [];
+  const srv = new McpServer({ cwd: ws, stdout: { write: s => sent.push(JSON.parse(s)) } });
+  const send = o => srv.handleLine(JSON.stringify(o));
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-code' } } });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_peers', arguments: {} } });
+  await flush();
+  const t = sent[1].result.content[0].text;
+  assert.ok(t.includes('half-finished work'), 'a dead-end answer would hide recoverable work');
+  srv.shutdown();
+});
+
+test('sb_peers advertises the `all` parameter', () => {
+  const t = require('../src/mcp').TOOLS.find(x => x.name === 'sb_peers');
+  assert.ok(t.inputSchema.properties.all, 'the model needs to know it can ask for everything');
+  assert.ok(/sbs/.test(t.inputSchema.properties.all.description));
+});
+
+test('/sbs offers an interactive pick over live AND ended sessions', () => {
+  const ws = tmpWs('idx6');
+  const home = path.join(tmpRoot, 'home-idx');
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  I.apply(ws, { home });
+  const body = fs.readFileSync(path.join(ws, '.claude/commands/sbs.md'), 'utf8');
+  assert.ok(body.includes('sb_pick'), 'bare /sbs runs the picker');
+  assert.ok(/live and\s+ended/i.test(body), 'both states offered');
+  assert.ok(/arrow keys/i.test(body), 'selection is interactive, not typed');
+});
+
+test('parseMentions finds tags without inventing them', () => {
+  assert.deepEqual(C.parseMentions('what is @sbs1 doing?'), ['sbs1']);
+  assert.deepEqual(C.parseMentions('compare @sbs1 and @sbs2'), ['sbs1', 'sbs2']);
+  assert.deepEqual(C.parseMentions('(@auth-fix) and [@sbs3]'), ['auth-fix', 'sbs3']);
+  assert.deepEqual(C.parseMentions('@sbs1 @sbs1'), ['sbs1'], 'deduped');
+  assert.deepEqual(C.parseMentions('no tags here'), []);
+  assert.deepEqual(C.parseMentions('email me@example.com'), [], 'an email is not a mention');
+  assert.deepEqual(C.parseMentions('arr[i]@2'), [], 'not preceded by a boundary');
+});
+
+test('@<name> pulls that session into context', () => {
+  const { ws, store } = twoSessions('at-m1');
+  const nm = store.getSession('A').name;
+  const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: `what did @${nm} find?` }, { agent: CC }).output;
+  assert.ok(out, 'a resolvable tag must inject');
+  assert.ok(out.includes('exp compared in ms'), "the tagged session's finding");
+  assert.ok(out.includes('auth.ts'), 'and its files');
+  assert.ok(out.includes('<switchboard-peer-state>'), 'still wrapped as untrusted data');
+  assert.ok(!out.includes('write checkout tests'), 'untagged sessions stay out');
+  store.close();
+});
+
+test('tagging several sessions returns all of them, still capped', () => {
+  const { ws, store } = twoSessions('at-m2');
+  const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: `compare @${store.getSession('A').name} and @${store.getSession('B').name}` }, { agent: CC }).output;
+  assert.ok(out.includes('debug the login 500s') && out.includes('write checkout tests'));
+  assert.ok(D.estimateTokens(out) <= 1400, 'multi-mention budget still bounded');
+  store.close();
+});
+
+test('a session can be tagged by NAME, not only by handle', () => {
+  const { ws, store } = twoSessions('at-m3');
+  const nm = store.getSession('A').name;
+  const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: `what is @${nm} up to?` }, { agent: CC }).output;
+  assert.ok(out && out.includes('debug the login 500s'));
+  store.close();
+});
+
+test('an unresolvable @tag injects NOTHING — no false positives', () => {
+  const { ws, store } = twoSessions('at-m4');
+  for (const p of ['ping @nobody about this', 'mail me@example.com', 'use @decorator in the class', '@no-such-session does not exist']) {
+    const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws, user_input: p }, { agent: CC }).output;
+    assert.ok(!out || !out.includes('referenced'), `must not inject for: ${p}`);
+  }
+  store.close();
+});
+
+test('you cannot @tag yourself into your own context', () => {
+  const { ws, store } = twoSessions('at-m5');
+  const me = store.getSession('ME');
+  const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: `what about @sbs${me.slot}?` }, { agent: CC }).output;
+  assert.ok(!out || !out.includes('referenced'), 'self-reference is a no-op');
+  store.close();
+});
+
+test('mentions take priority over the periodic delta injection', () => {
+  const { ws, store } = twoSessions('at-m6');
+  const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: `tell me about @${store.getSession('A').name}` }, { agent: CC }).output;
+  assert.ok(out.includes('referenced'), 'the explicit ask wins over the ambient delta');
+  store.close();
+});
+
+test('the roster tells the user that @tagging exists', () => {
+  const { ws, store } = twoSessions('at-m7');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'FRESH', cwd: ws }, { agent: CC });
+  const out = H.handle({ hook_event_name: 'SessionStart', session_id: 'FRESH2', cwd: ws }, { agent: CC }).output;
+  assert.ok(/@[a-z0-9-]+/.test(out), 'discoverable without reading docs');
+  store.close();
+});
+
+// --------------------------------------------------- semantic names ----
+group('semantic session names');
+
+test('deriveLabel turns an intent into a readable name', () => {
+  const cases = [
+    ['debug the login 500 errors',        'debug-login-500-errors'],
+    ['migrate the content collections',   'migrate-content-collections'],
+    ['can you please help me refactor the auth middleware', 'refactor-auth-middleware'],
+    ['add tests for checkout',            'add-tests-checkout'],
+  ];
+  for (const [intent, expect] of cases) assert.equal(C.deriveLabel(intent), expect, intent);
+});
+
+test('deriveLabel strips filler and never runs long', () => {
+  const n = C.deriveLabel('so I just really need you to please fix this thing in the repository now');
+  assert.ok(!/\b(just|really|please|the|this)\b/.test(n), `filler leaked: ${n}`);
+  assert.ok(n.length <= 28, `too long: ${n}`);
+  assert.ok(!n.endsWith('-'), 'no trailing dash');
+});
+
+test('deriveLabel falls back to the file when there is no intent', () => {
+  assert.equal(C.deriveLabel('', ['/w/middleware/session.ts']), 'working-session');
+  assert.equal(C.deriveLabel('', []), null);
+  assert.equal(C.deriveLabel('the a of to and', []), null, 'pure filler yields nothing');
+});
+
+test('a session is named from its first prompt', () => {
+  const ws = tmpWs('nm1');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws,
+    user_input: 'fix the astro dev server startup' }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  assert.equal(store.getSession('A').name, 'fix-astro-dev-server');
+  store.close();
+});
+
+test('the name NEVER changes once assigned', () => {
+  const ws = tmpWs('nm2');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'fix the auth bug' }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  const first = store.getSession('A').name;
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'now write the docs instead' }, { agent: CC });
+  H.handle({ hook_event_name: 'PostToolUse', session_id: 'A', cwd: ws, tool_name: 'Edit', tool_input: { file_path: path.join(ws, 'x.ts') } }, { agent: CC });
+  assert.equal(store.getSession('A').name, first, 'a renamed session breaks every existing reference');
+  store.close();
+});
+
+test('two sessions doing the same thing get distinct names', () => {
+  const ws = tmpWs('nm3');
+  for (const id of ['A', 'B', 'C']) {
+    H.handle({ hook_event_name: 'SessionStart', session_id: id, cwd: ws }, { agent: CC });
+    H.handle({ hook_event_name: 'UserPromptSubmit', session_id: id, cwd: ws, user_input: 'fix the auth bug' }, { agent: CC });
+  }
+  const store = new Store(W.storePath(ws));
+  const names = ['A', 'B', 'C'].map(i => store.getSession(i).name);
+  assert.equal(new Set(names).size, 3, `names collided: ${names.join(', ')}`);
+  assert.equal(names[0], 'fix-auth-bug');
+  assert.ok(names[1].startsWith('fix-auth-bug-'), 'disambiguated, not random');
+  store.close();
+});
+
+test('a session with no prompt is named from the file it edits', () => {
+  const ws = tmpWs('nm4');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'PostToolUse', session_id: 'A', cwd: ws, tool_name: 'Edit',
+    tool_input: { file_path: path.join(ws, 'middleware/session.ts') } }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  assert.equal(store.getSession('A').name, 'working-session');
+  store.close();
+});
+
+test("the agent's OWN session name still resolves after we rename it", () => {
+  // Claude Code's native `@` typeahead (v2.1.232+) inserts ITS name for a
+  // session, e.g. @logline2-b2. Once switchboard renames that session to
+  // something semantic, the typeahead's name must still resolve — otherwise
+  // the two naming schemes silently disagree.
+  const ws = tmpWs('alias1');
+  const WS = W.resolveWorkspace(ws);
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  const agentName = store.getSession('A').name;          // the derived one
+  store.upsertSession({ session_id: 'A', alias: agentName });
+  store.close();
+
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws,
+    user_input: 'refactor the auth middleware' }, { agent: CC });
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'ME', cwd: ws }, { agent: CC });
+
+  const s2 = new Store(W.storePath(ws));
+  assert.equal(s2.getSession('A').name, 'refactor-auth-middleware', 'renamed semantically');
+  assert.equal(s2.getSession('A').alias, agentName, 'but the agent name is kept');
+  assert.ok(C.findTarget(s2, WS, agentName, 'ME'), "the agent's own name still resolves");
+  assert.ok(C.findTarget(s2, WS, 'refactor-auth-middleware', 'ME'), 'and so does the semantic one');
+  s2.close();
+
+  const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: `what is @${agentName} doing?` }, { agent: CC }).output;
+  assert.ok(out && out.includes('refactor the auth middleware'),
+    '@<agent name> from the native typeahead must work');
+});
+
+test('the index shows both names so either is discoverable', () => {
+  const ws = tmpWs('alias2');
+  const WS = W.resolveWorkspace(ws);
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  store.upsertSession({ session_id: 'A', alias: 'logline2-b2' });
+  store.close();
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'fix the parser' }, { agent: CC });
+  const s2 = new Store(W.storePath(ws));
+  const body = C.sessionIndex(s2, WS, null, { all: true }).body;
+  assert.ok(body.includes('fix-parser'), 'semantic name');
+  assert.ok(body.includes('aka logline2-b2'), "and the agent's own name");
+  s2.close();
+});
+
+test('the name is resolvable by @tag and by attach', () => {
+  const ws = tmpWs('nm5');
+  const WS = W.resolveWorkspace(ws);
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'migrate the content collections' }, { agent: CC });
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'ME', cwd: ws }, { agent: CC });
+
+  const store = new Store(W.storePath(ws));
+  assert.ok(C.findTarget(store, WS, 'migrate-content-collections', 'ME'), 'attach by name');
+  store.close();
+
+  const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: 'what is @migrate-content-collections doing?' }, { agent: CC }).output;
+  assert.ok(out && out.includes('migrate the content collections'), '@tag by name');
+});
+
+test('lists are addressed purely by name', () => {
+  const ws = tmpWs('nm6');
+  const WS = W.resolveWorkspace(ws);
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'debug the login 500 errors' }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  const body = C.sessionIndex(store, WS, null, { all: true }).body;
+  assert.ok(body.includes('debug-login-500-errors'), 'name present');
+  assert.ok(!/sbs\d/.test(body), 'no numbered handles anywhere');
+  store.close();
+});
+
+test('describe() gives a one-line description, falling back sensibly', () => {
+  assert.equal(D.describe({ intent: 'fix auth' }, null), 'fix auth');
+  assert.equal(D.describe({}, { intent: 'from digest' }), 'from digest');
+  assert.equal(D.describe({}, { last_msg: 'latest finding' }), 'latest finding');
+  assert.equal(D.describe({}, {}), null);
+});
+
+// ----------------------------------------------------------- picker ----
+group('arrow-key picker (zero-token browsing)');
+
+const { pick } = require('../src/picker');
+const { EventEmitter } = require('node:events');
+
+// A fake TTY we can drive with synthetic keypresses.
+function fakeTTY() {
+  const input = new EventEmitter();
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  input.resume = () => {};
+  input.pause = () => {};
+  const frames = [];
+  const output = { write: s => frames.push(s), columns: 100 };
+  input.press = name => input.emit('keypress', '', { name });
+  return { input, output, frames };
+}
+
+function pickerSessions() {
+  return [
+    { session_id: 'A', name: 'auth-fix', agent: 'claude-code', live: true, status: 'idle',
+      last_seen: Date.now(), intent: 'debug the login 500s' },
+    { session_id: 'B', name: 'ui-polish', agent: 'cursor', live: true, status: 'active',
+      last_seen: Date.now(), intent: 'restyle checkout' },
+    { session_id: 'C', name: 'migration', agent: 'codex', live: false, status: 'ended',
+      last_seen: Date.now() - 3600_000, intent: 'backfill tenant_id' },
+  ];
+}
+
+test('lists live AND ended sessions in the picker', async () => {
+  const { input, output, frames } = fakeTTY();
+  const p = pick(pickerSessions(), { workspace: '/w' }, { input, output });
+  input.press('escape');
+  await p;
+  const screen = frames.join('');
+  assert.ok(screen.includes('auth-fix') && screen.includes('ui-polish') && screen.includes('migration'));
+  assert.ok(screen.includes('live') && screen.includes('ended'));
+  assert.ok(!/sbs\d/.test(screen), 'no numbered handles — names only');
+});
+
+test('down-arrow then enter selects the second session', async () => {
+  const { input, output } = fakeTTY();
+  const p = pick(pickerSessions(), { workspace: '/w' }, { input, output });
+  input.press('down');
+  input.press('return');
+  assert.equal((await p).session_id, 'B');
+});
+
+test('up-arrow wraps around to the last session', async () => {
+  const { input, output } = fakeTTY();
+  const p = pick(pickerSessions(), { workspace: '/w' }, { input, output });
+  input.press('up');
+  input.press('return');
+  assert.equal((await p).session_id, 'C', 'wrapping reaches the ended session');
+});
+
+test('an ENDED session is selectable — that is the main use', async () => {
+  const { input, output } = fakeTTY();
+  const p = pick(pickerSessions(), { workspace: '/w' }, { input, output });
+  input.press('down'); input.press('down');
+  input.press('return');
+  const chosen = await p;
+  assert.equal(chosen.session_id, 'C');
+  assert.equal(chosen.live, false);
+});
+
+test('escape and q cancel without selecting', async () => {
+  for (const key of ['escape', 'q']) {
+    const { input, output } = fakeTTY();
+    const p = pick(pickerSessions(), { workspace: '/w' }, { input, output });
+    input.press(key);
+    assert.equal(await p, null, `${key} must cancel`);
+  }
+});
+
+test('typing a number jumps straight to that row', async () => {
+  const { input, output } = fakeTTY();
+  const p = pick(pickerSessions(), { workspace: '/w' }, { input, output });
+  input.press('3');
+  input.press('return');
+  assert.equal((await p).session_id, 'C');
+});
+
+// The fakeTTY above emits pre-parsed key objects, which SKIPS readline's
+// parser. A real terminal sends escape bytes. These drive the actual byte path.
+function byteTTY() {
+  const { PassThrough } = require('node:stream');
+  const input = new PassThrough();
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  return input;
+}
+const KEY = { up: '\x1b[A', down: '\x1b[B', enter: '\r', esc: '\x1b' };
+
+test('REAL arrow-key escape sequences move the cursor', async () => {
+  const out = { write: () => {}, columns: 90 };
+  const cases = [
+    [[KEY.down, KEY.enter], 'B', 'down'],
+    [[KEY.down, KEY.down, KEY.enter], 'C', 'down twice'],
+    [[KEY.up, KEY.enter], 'C', 'up wraps to the end'],
+    [[KEY.down, KEY.down, KEY.up, KEY.enter], 'B', 'down down up'],
+  ];
+  for (const [keys, expect, label] of cases) {
+    const input = byteTTY();
+    const p = pick(pickerSessions(), { workspace: '/w' }, { input, output: out });
+    for (const k of keys) input.write(k);
+    const got = await p;
+    assert.equal(got && got.session_id, expect, `${label} should land on ${expect}`);
+  }
+});
+
+test('a REAL escape byte cancels', async () => {
+  const input = byteTTY();
+  const p = pick(pickerSessions(), { workspace: '/w' }, { input, output: { write: () => {}, columns: 90 } });
+  input.write(KEY.esc);
+  assert.equal(await p, null);
+});
+
+test('picker shows the keybindings so it needs no docs', async () => {
+  const { input, output, frames } = fakeTTY();
+  const p = pick(pickerSessions(), { workspace: '/w' }, { input, output });
+  input.press('escape');
+  await p;
+  const screen = frames.join('');
+  assert.ok(screen.includes('enter') && /move/.test(screen) && /cancel/.test(screen));
+});
+
+// Without a raw-mode TTY there are no arrow keys, but selection must STILL be
+// possible — printing a list and then giving up is a dead end.
+function pipedStdin(text) {
+  const { PassThrough } = require('node:stream');
+  const input = new PassThrough();
+  input.isTTY = false;
+  if (text !== undefined) { input.write(text); input.end(); }
+  return input;
+}
+
+test('a non-TTY offers a numbered list you can actually select from', async () => {
+  const out = [];
+  const chosen = await pick(pickerSessions(), { workspace: '/w' },
+    { input: pipedStdin('2\n'), output: { write: s => out.push(s) } });
+  assert.ok(chosen, 'selection must be possible without arrow keys');
+  assert.equal(chosen.session_id, 'B');
+  const screen = out.join('');
+  assert.ok(screen.includes('auth-fix') && screen.includes('Select 1-3'));
+});
+
+test('the numbered fallback also accepts a name or prefix', async () => {
+  for (const [typed, expect] of [['migration', 'C'], ['ui-polish', 'B'], ['auth-fix', 'A'], ['ui-pol', 'B']]) {
+    const chosen = await pick(pickerSessions(), { workspace: '/w' },
+      { input: pipedStdin(`${typed}\n`), output: { write: () => {} } });
+    assert.equal(chosen && chosen.session_id, expect, `typing "${typed}" should select ${expect}`);
+  }
+});
+
+test('the fallback re-prompts on a bad answer instead of giving up', async () => {
+  const out = [];
+  const chosen = await pick(pickerSessions(), { workspace: '/w' },
+    { input: pipedStdin('nonsense\n3\n'), output: { write: s => out.push(s) } });
+  assert.equal(chosen.session_id, 'C');
+  assert.ok(out.join('').includes('no match'), 'says why, then asks again');
+});
+
+test('blank input cancels cleanly', async () => {
+  const chosen = await pick(pickerSessions(), { workspace: '/w' },
+    { input: pipedStdin('\n'), output: { write: () => {} } });
+  assert.equal(chosen, null);
+});
+
+test('closed stdin explains how to select directly, rather than vanishing', async () => {
+  const out = [];
+  const chosen = await pick(pickerSessions(), { workspace: '/w' },
+    { input: pipedStdin(''), output: { write: s => out.push(s) } });
+  assert.equal(chosen, null);
+  assert.ok(out.join('').includes('switchboard sbs 1'), 'must tell the user what to do next');
+});
+
+test('an empty session list resolves immediately', async () => {
+  const { input, output } = fakeTTY();
+  assert.equal(await pick([], { workspace: '/w' }, { input, output }), null);
+});
+
+test('picking costs ZERO tokens — nothing is written to the store', async () => {
+  // The point of a terminal picker: the model never sees the sessions you
+  // scrolled past. Only the one you choose is injected, later, at SessionStart.
+  const { store, ws } = freshStore('pick-cost');
+  store.upsertSession({ session_id: 'A', workspace: ws, agent_pid: process.pid });
+  const before = store._all('SELECT * FROM events').length;
+
+  const { input, output } = fakeTTY();
+  const p = pick(pickerSessions(), { workspace: ws }, { input, output });
+  input.press('down'); input.press('up'); input.press('down'); input.press('return');
+  await p;
+
+  assert.equal(store._all('SELECT * FROM events').length, before,
+    'browsing records no injection and spends no context');
+  store.close();
+});
+
+// ------------------------------------------- ambient token budget ----
+group('ambient token budget');
+
+function twoPeerWs(name) {
+  const ws = tmpWs(name);
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'P1', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'P1', cwd: ws, user_input: 'debug the login 500s' }, { agent: CC });
+  H.handle({ hook_event_name: 'PostToolUse', session_id: 'P1', cwd: ws, tool_name: 'Edit', tool_input: { file_path: path.join(ws, 'auth.ts') } }, { agent: CC });
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'P2', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'P2', cwd: ws, user_input: 'restyle the cards' }, { agent: CC });
+  return ws;
+}
+
+test('mode "off" injects EXACTLY nothing, even with peers live', () => {
+  const ws = twoPeerWs('mode-off');
+  C.ensureStoreDir(W.resolveWorkspace(ws));
+  C.writeMode(W.resolveWorkspace(ws), 'off');
+  const out = H.handle({ hook_event_name: 'SessionStart', session_id: 'ME', cwd: ws }, { agent: CC }).output;
+  assert.equal(out, null, 'a true zero-token floor');
+});
+
+test('mode "lean" costs an order of magnitude less than full', () => {
+  const ws = twoPeerWs('mode-lean');
+  const WS = W.resolveWorkspace(ws);
+  const store = new Store(W.storePath(ws));
+
+  const full = C.injectionText(store, WS, 'ME', { mode: 'full' });
+  const lean = C.injectionText(store, WS, 'ME', { mode: 'lean' });
+  assert.ok(lean.tokens > 0 && lean.tokens < full.tokens / 5,
+    `lean ${lean.tokens} should be far under full ${full.tokens}`);
+  assert.ok(lean.text.includes('sb_peers'), 'a pointer the model can act on');
+  assert.ok(!lean.text.includes('auth.ts'), 'no payload — that is the point');
+  assert.ok(!lean.text.includes('switchboard-peer-state'),
+    'no untrusted envelope: the line carries no peer-authored text');
+  store.close();
+});
+
+test('every mode still allows full on-demand access', () => {
+  const ws = twoPeerWs('mode-pull');
+  const WS = W.resolveWorkspace(ws);
+  C.writeMode(WS, 'off');
+  const store = new Store(W.storePath(ws));
+  // Ambient is silent, but the tools are untouched.
+  assert.equal(C.injectionText(store, WS, 'ME').tokens, 0);
+  assert.ok(C.sessionIndex(store, WS, 'ME').body.includes('debug-login-500s'),
+    'sb_peers-style access is unaffected by the ambient budget');
+  store.close();
+});
+
+test('mode persists and defaults to full', () => {
+  const ws = tmpWs('mode-persist');
+  const WS = W.resolveWorkspace(ws);
+  C.ensureStoreDir(WS);
+  assert.equal(C.readMode(WS), 'full', 'default');
+  C.writeMode(WS, 'lean');
+  assert.equal(C.readMode(WS), 'lean', 'persisted');
+  C.writeMode(WS, 'off');
+  assert.equal(C.readMode(WS), 'off');
+});
+
+test('a corrupt config falls back to full rather than breaking', () => {
+  const ws = tmpWs('mode-corrupt');
+  const WS = W.resolveWorkspace(ws);
+  C.ensureStoreDir(WS);
+  fs.writeFileSync(path.join(W.storeDir(WS), 'config.json'), '{not json');
+  assert.equal(C.readMode(WS), 'full');
+});
+
+// ------------------------------------------ active references ----
+group('@tag stays active');
+
+function refWorkspace(name) {
+  const ws = tmpWs(name);
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'PEER', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'PEER', cwd: ws, user_input: 'debug the login 500s' }, { agent: CC });
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'ME', cwd: ws }, { agent: CC });
+  return ws;
+}
+
+test('tagging a session confirms it VISIBLY to the user', () => {
+  const ws = refWorkspace('ref1');
+  const r = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: `what is @${nameOf(ws, 'PEER')} doing?` }, { agent: CC });
+  assert.ok(r.notice, 'a resolved tag must be acknowledged, not silently absorbed');
+  assert.ok(r.notice.includes('referencing'));
+  assert.ok(r.notice.includes(nameOf(ws, 'PEER')));
+  assert.ok(r.notice.includes('\x1b[38;5;111m'), 'blue, matching the [SWITCHBOARD] badge');
+});
+
+test('the notice reaches the user as a systemMessage', () => {
+  const ws = refWorkspace('ref2');
+  let out = '';
+  H.run({ input: JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: `check @${nameOf(ws, 'PEER')}` }), agent: CC, stdout: { write: s2 => { out += s2; } } });
+  const payload = JSON.parse(out);
+  assert.ok(payload.systemMessage, 'systemMessage is what the USER sees');
+  assert.ok(payload.systemMessage.includes('referencing'));
+  assert.ok(payload.hookSpecificOutput.additionalContext, 'and the model still gets the context');
+});
+
+test('a tagged session STAYS referenced on later turns', () => {
+  const ws = refWorkspace('ref3');
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws, user_input: `tell me about @${nameOf(ws, 'PEER')}` }, { agent: CC });
+
+  const store = new Store(W.storePath(ws));
+  assert.equal(store.refsFor('ME').length, 1, 'the reference persists');
+  store.close();
+
+  // The peer does something new; a plain prompt should now carry the update.
+  H.handle({ hook_event_name: 'Stop', session_id: 'PEER', cwd: ws,
+    last_assistant_message: 'root cause: exp compared in ms' }, { agent: CC });
+  const r = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
+    user_input: 'ok carry on' }, { agent: CC });
+  assert.ok(r.output && r.output.includes('exp compared in ms'), 'no re-tagging needed');
+  assert.ok(r.notice && r.notice.includes('update from'));
+});
+
+test('a reference is SILENT when the peer has not moved', () => {
+  const ws = refWorkspace('ref4');
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws, user_input: `about @${nameOf(ws, 'PEER')}` }, { agent: CC });
+  H.handle({ hook_event_name: 'Stop', session_id: 'PEER', cwd: ws, last_assistant_message: 'found it' }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws, user_input: 'next' }, { agent: CC });
+  // Nothing has changed since that update was delivered.
+  const again = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws, user_input: 'and next' }, { agent: CC });
+  assert.ok(!again.output || !again.output.includes('Update from'),
+    'a reference that chatters every turn is worse than none');
+});
+
+test('"@sbs stop" clears every reference', () => {
+  const ws = refWorkspace('ref5');
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws, user_input: `about @${nameOf(ws, 'PEER')}` }, { agent: CC });
+  const r = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws, user_input: '@sbs stop' }, { agent: CC });
+  assert.ok(r.notice && r.notice.includes('stopped referencing'));
+  const store = new Store(W.storePath(ws));
+  assert.equal(store.refsFor('ME').length, 0, 'a sticky reference you cannot turn off is a leak');
+  store.close();
+});
+
+test('an ended peer stops producing updates', () => {
+  const ws = refWorkspace('ref6');
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws, user_input: `about @${nameOf(ws, 'PEER')}` }, { agent: CC });
+  H.handle({ hook_event_name: 'Stop', session_id: 'PEER', cwd: ws, last_assistant_message: 'done' }, { agent: CC });
+  H.handle({ hook_event_name: 'SessionEnd', session_id: 'PEER', cwd: ws }, { agent: CC });
+  const r = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws, user_input: 'anything?' }, { agent: CC });
+  assert.ok(!r.output || !r.output.includes('Update from'));
+});
+
 // ------------------------------------------------------ status line ----
 group('status line indicator');
 
 const { execFileSync } = require('node:child_process');
 const SL_BIN = path.join(__dirname, '..', 'bin', 'switchboard-statusline.js');
 
-function renderStatusline(cwd, configDir) {
+function renderStatusline(cwd, configDir, sessionId) {
   return execFileSync(process.execPath, [SL_BIN], {
-    input: JSON.stringify({ cwd, workspace: { current_dir: cwd } }),
+    input: JSON.stringify({ cwd, session_id: sessionId, workspace: { current_dir: cwd } }),
     encoding: 'utf8',
     env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
   });
@@ -1182,16 +2126,37 @@ test('detects installation via .mcp.json, not only the store dir', () => {
   assert.ok(renderStatusline(ws, cfg).includes('[SWITCHBOARD]'));
 });
 
-test('shows the live peer count when peers exist', () => {
+test('shows only [SWITCHBOARD] — no handle, no counts', () => {
+  // `[SWITCHBOARD:2]` was ambiguous: it read like the handle sbs2 but meant
+  // "2 peers". Your own handle is what another session needs to @tag you.
   const cfg = path.join(tmpRoot, 'sl-cfg3');
   fs.mkdirSync(cfg, { recursive: true });
   const ws = tmpWs('sl-peers');
-  const store = new Store(W.storePath(ws));
   const resolved = W.resolveWorkspace(ws);
-  store.upsertSession({ session_id: 'p1', workspace: resolved, agent_pid: process.pid, agent: 'claude-code' });
-  store.upsertSession({ session_id: 'p2', workspace: resolved, agent_pid: process.pid, agent: 'cursor' });
+  const store = new Store(W.storePath(ws));
+  for (const id of ['me', 'p1', 'p2']) {
+    store.upsertSession({ session_id: id, workspace: resolved, agent_pid: process.pid, agent: 'claude-code' });
+  }
   store.close();
-  assert.ok(renderStatusline(ws, cfg).includes('[SWITCHBOARD:2]'));
+
+  const out = renderStatusline(ws, cfg, 'me');
+  assert.ok(out.includes('[SWITCHBOARD]'), 'the badge shows');
+  assert.ok(!/sbs\d/.test(out), 'no handle');
+  assert.ok(!/\+\d/.test(out), 'no peer count');
+  assert.ok(!/SWITCHBOARD:\d/.test(out), 'and none of the older forms');
+});
+
+test('the badge is identical whether alone or among peers', () => {
+  const cfg = path.join(tmpRoot, 'sl-cfg3b');
+  fs.mkdirSync(cfg, { recursive: true });
+  const ws = tmpWs('sl-alone');
+  const resolved = W.resolveWorkspace(ws);
+  const store = new Store(W.storePath(ws));
+  store.upsertSession({ session_id: 'solo', workspace: resolved, agent_pid: process.pid, agent: 'claude-code' });
+  store.close();
+  const out = renderStatusline(ws, cfg, 'solo');
+  assert.ok(out.includes('[SWITCHBOARD]'));
+  assert.ok(!/sbs|\+/.test(out), 'stable regardless of who else is around');
 });
 
 test('chains the previous statusline instead of clobbering it', () => {
@@ -1314,7 +2279,7 @@ test('three sessions, one workspace — C opens and already knows about A and B'
   assert.equal(after.output, null, "a dead session's claim must never block");
 });
 
-test('mixed T1/T3: an MCP-only agent joins the same roster', () => {
+test('mixed T1/T3: an MCP-only agent joins the same roster', async () => {
   const ws = tmpWs('e2e2');
   H.handle({ hook_event_name: 'SessionStart', session_id: 'hooked', cwd: ws }, { agent: CC });
 
@@ -1322,6 +2287,7 @@ test('mixed T1/T3: an MCP-only agent joins the same roster', () => {
   const srv = new McpServer({ cwd: ws, stdout: { write: s => sent.push(JSON.parse(s)) } });
   srv.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex-cli' } } }));
   srv.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_peers', arguments: {} } }));
+  await flush();
   assert.ok(sent[1].result.content[0].text.includes('hooked') ||
             sent[1].result.content[0].text.includes(W.agentLabel(CC)), 'T1 agent sees the T3 session');
 
@@ -1331,6 +2297,8 @@ test('mixed T1/T3: an MCP-only agent joins the same roster', () => {
 });
 
 // ---------------------------------------------------------------------------
-console.log(`\n${fail ? '\x1b[31m' : '\x1b[32m'}${pass} passed, ${fail} failed\x1b[0m`);
-try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
-process.exit(fail ? 1 : 0);
+Promise.all(pending).then(() => {
+  console.log(`\n${fail ? '\x1b[31m' : '\x1b[32m'}${pass} passed, ${fail} failed\x1b[0m`);
+  try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
+  process.exit(fail ? 1 : 0);
+});

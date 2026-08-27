@@ -25,7 +25,17 @@ const TOOLS = [
       'List the other AI coding sessions currently live in this workspace, what each is working on, ' +
       'and which files each has claimed. Call this before starting a task so you do not duplicate ' +
       'work or edit a file another session is mid-change on.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        all: {
+          type: 'boolean',
+          description: 'Include ENDED sessions too. Use when the user asks to see all sessions, ' +
+            'or types /sbs or @sbs. Ended sessions can still be attached to.',
+        },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: 'sb_session',
@@ -35,7 +45,7 @@ const TOOLS = [
       'looks relevant to what you are about to do.',
     inputSchema: {
       type: 'object',
-      properties: { name: { type: 'string', description: 'Session name as shown by sb_peers.' } },
+      properties: { name: { type: 'string', description: 'Session name, e.g. fix-auth-tokens, as shown by sb_peers.' } },
       required: ['name'], additionalProperties: false,
     },
   },
@@ -94,13 +104,32 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Session name (or id) to take over, as shown by sb_peers.' },
+        name: { type: 'string', description: 'Session name to take over, e.g. fix-auth-tokens, as shown by sb_peers.' },
         adopt: {
           type: 'boolean',
           description: 'Also take ownership of its claimed files. Only applies if that session has ended.',
         },
       },
       required: ['name'], additionalProperties: false,
+    },
+  },
+  {
+    name: 'sb_pick',
+    description:
+      'Show the user an interactive list of the LIVE sessions in this workspace and let them CHOOSE ' +
+      'one, then return that session\'s full context so you can continue its work. This is what the ' +
+      '/sbs command runs. Use it whenever the user asks to see, pick, browse or switch between ' +
+      'sessions without naming one. Do not print the list yourself — this tool shows it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        all: {
+          type: 'boolean',
+          description: 'Also offer ENDED sessions. Use when the user asks for older or finished ' +
+            'sessions, or when no session is live.',
+        },
+      },
+      additionalProperties: false,
     },
   },
   {
@@ -130,6 +159,9 @@ class McpServer {
     this.agent = 'unknown';
     this.name = null;
     this.registered = false;
+    this.pending = new Map();   // outbound requests awaiting a client response
+    this.reqSeq = 0;
+    this.clientCaps = null;
   }
 
   send(msg) {
@@ -149,9 +181,61 @@ class McpServer {
     this.dispatch(msg);
   }
 
+  // ---- server -> client requests (elicitation) -----------------------------
+
+  // MCP lets a SERVER ask the CLIENT for input mid-tool-call. Claude Code
+  // renders an enum schema as an interactive picker, which is how `/sbs` gets
+  // an arrow-key list INSIDE a session — the session owns stdin, so a terminal
+  // TUI is impossible there, but the client can draw one on our behalf.
+  request(method, params, timeoutMs = 120_000) {
+    return new Promise(resolve => {
+      const id = `sb-${++this.reqSeq}`;
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        resolve(null);                          // never hang a tool call
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, { resolve, timer });
+      this.send({ jsonrpc: '2.0', id, method, params });
+    });
+  }
+
+  // Ask the user to choose one session. Returns the chosen value, or null when
+  // the client can't elicit, the user declines, or nothing answers in time.
+  async elicitChoice({ message, options }) {
+    if (!this.clientCaps?.elicitation) return null;
+    const res = await this.request('elicitation/create', {
+      message,
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          session: {
+            type: 'string',
+            title: 'Session',
+            description: 'The session whose work you want to continue.',
+            enum: options.map(o => o.value),
+            enumNames: options.map(o => o.label),
+          },
+        },
+        required: ['session'],
+      },
+    });
+    if (!res || res.action !== 'accept') return null;
+    return res.content?.session ?? null;
+  }
+
   dispatch(msg) {
     const { id, method, params } = msg || {};
-    if (!method) return;                       // a response to us; we send none
+
+    // A response to a request WE sent (elicitation). Route it, don't drop it.
+    if (!method && id !== undefined && this.pending.has(id)) {
+      const p = this.pending.get(id);
+      this.pending.delete(id);
+      clearTimeout(p.timer);
+      p.resolve(msg.error ? null : msg.result);
+      return;
+    }
+    if (!method) return;                       // any other stray response
     try {
       switch (method) {
         case 'initialize':                return this.onInitialize(id, params);
@@ -174,6 +258,7 @@ class McpServer {
 
   onInitialize(id, params) {
     const client = params?.clientInfo || {};
+    this.clientCaps = params?.capabilities || {};
     this.agent = W.normalizeAgent(client.name);
     const ident = C.resolveIdentity({ agent: this.agent, cwd: this.cwd, agent_pid: this.agentPid });
     this.sessionId = ident.session_id;
@@ -223,13 +308,14 @@ class McpServer {
     const fn = this.tools()[name];
     if (!fn) return this.fail(id, -32602, `unknown tool: ${name}`);
 
-    const out = fn(args);
-    this.ctx.store.event('pull', {
-      session_id: this.sessionId, workspace: this.ctx.workspace,
-      tokens: D.estimateTokens(out), detail: name,
-    });
-    C.writeRoster(this.ctx.store, this.ctx.workspace);
-    this.reply(id, text(out));
+    Promise.resolve(fn(args)).then(out => {
+      this.ctx.store.event('pull', {
+        session_id: this.sessionId, workspace: this.ctx.workspace,
+        tokens: D.estimateTokens(out), detail: name,
+      });
+      C.writeRoster(this.ctx.store, this.ctx.workspace);
+      this.reply(id, text(out));
+    }, e => this.fail(id, -32603, `tool failed: ${e && e.message}`));
   }
 
   tools() {
@@ -238,38 +324,32 @@ class McpServer {
     const self = this.sessionId;
 
     return {
-      sb_peers: () => {
+      sb_peers: ({ all } = {}) => {
         C.sweep(store, ws);
+        // `all` is the full directory: live AND ended, every handle visible.
+        if (all) return C.sessionIndex(store, ws, self, { maxTokens: 4000, all: true }).body;
         const ctx = C.rosterContext(store, ws, self);
-        if (!ctx.peers.length) return 'No other sessions are live in this workspace right now.';
+        if (!ctx.peers.length) {
+          // Nothing live, but ended sessions are still recoverable work — say
+          // so rather than answering with a flat "nobody here".
+          const idx = C.sessionIndex(store, ws, self, { maxTokens: 2000, all: true });
+          return idx.sessions.length
+            ? `No other sessions are LIVE right now, but these ended sessions can still be attached to:\n\n${idx.body}`
+            : 'No other sessions are live in this workspace right now.';
+        }
         // Pull path: no cap — the model asked, so give it the detail (ADR-1).
         return D.renderRoster(ctx.peers, ctx, { maxTokens: 4000 });
       },
 
       sb_session: ({ name }) => {
-        const ctx = C.rosterContext(store, ws, self);
-        const peer = ctx.peers.find(p =>
-          (p.name || '').toLowerCase() === String(name || '').toLowerCase() ||
-          p.session_id === name || p.session_id.startsWith(String(name || '')));
-        if (!peer) {
-          const avail = ctx.peers.map(p => p.name || p.session_id.slice(0, 8)).join(', ') || '(none)';
-          return `No live session named "${name}". Live sessions: ${avail}`;
+        const target = C.findTarget(store, ws, name, self);
+        if (!target) {
+          const avail = store.attachCandidates(ws, self, W.DEFAULTS.liveTtlMs)
+            .map(p => p.name || p.session_id.slice(0, 8)).join(', ') || '(none)';
+          return `No session named "${name}". Sessions: ${avail}`;
         }
-        const d = store.getDigest(peer.session_id);
-        const claims = store.claimsFor(peer.session_id);
-        const lines = [
-          `Session: ${peer.name || peer.session_id}  [${W.agentLabel(peer.agent)}]`,
-          `Status: ${peer.status} (last active ${D.ago(Date.now() - peer.last_seen)})`,
-        ];
-        if (peer.intent || d?.intent) lines.push(`Working on: ${peer.intent || d.intent}`);
-        if (claims.length) {
-          lines.push(`Claimed files (${claims.every(c => c.observed) ? 'observed' : 'self-declared'}):`);
-          for (const c of claims) lines.push(`  - ${D.relTo(ws, c.path)}${c.reason ? ` — ${c.reason}` : ''}`);
-        }
-        if (d?.files?.length) lines.push(`Files touched: ${d.files.slice(-25).join(', ')}`);
-        if (d?.commands?.length) lines.push(`Recent commands:\n${d.commands.slice(-10).map(c => `  $ ${c}`).join('\n')}`);
-        if (d?.last_msg) lines.push(`Latest: ${d.last_msg}`);
-        return D.wrapForInjection(lines.join('\n'));
+        const ctx = C.attachContext(store, ws, target.session_id);
+        return D.wrapForInjection(D.renderSessionDetail(ctx, { maxTokens: 1500 }));
       },
 
       sb_search: ({ query, limit }) => {
@@ -312,6 +392,44 @@ class McpServer {
         C.writeRoster(store, ws);
         const head = `Claimed ${list.length} file(s) for this session; other sessions will be warned.`;
         return conflicts.length ? `${head}\n\nHeads up — already claimed elsewhere:\n${conflicts.join('\n')}` : head;
+      },
+
+      sb_pick: async ({ all } = {}) => {
+        C.sweep(store, ws);
+        const idx = C.sessionIndex(store, ws, self, { maxTokens: 4000, all: !!all });
+        if (!idx.sessions.length) {
+          return idx.endedCount
+            ? `No sessions are live in this workspace. ${idx.endedCount} ended session(s) can still be continued — call sb_pick with all:true.`
+            : 'No sessions recorded in this workspace yet.';
+        }
+
+        const options = idx.sessions.map(s2 => {
+          const nm = s2.name || s2.session_id.slice(0, 8);
+          const d = store.getDigest(s2.session_id);
+          const desc = D.describe(s2, d);
+          return {
+            value: nm,
+            label: `${nm} · ${s2.live ? 'live' : 'ended'}${desc ? ` · ${D.truncate(D.collapse(desc), 60)}` : ''}`,
+          };
+        });
+
+        const chosen = await this.elicitChoice({
+          message: `Which session do you want to continue? (${idx.sessions.length} in this workspace)`,
+          options,
+        });
+
+        // No elicitation support, or the user dismissed it: fall back to the
+        // printed index so the request is never a dead end.
+        if (!chosen) {
+          return this.clientCaps?.elicitation
+            ? `No session selected.\n\n${idx.body}`
+            : idx.body;
+        }
+
+        const target = C.findTarget(store, ws, chosen, self);
+        if (!target) return `Could not resolve "${chosen}".\n\n${idx.body}`;
+        const r = C.performAttach(store, ws, target, self, {});
+        return r ? r.text : `Could not read context for "${chosen}".`;
       },
 
       sb_attach: ({ name, adopt }) => {

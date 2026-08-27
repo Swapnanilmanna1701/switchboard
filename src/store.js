@@ -7,7 +7,22 @@ const { DatabaseSync } = require('node:sqlite');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+
+// Columns added after v1 shipped. `CREATE TABLE IF NOT EXISTS` does NOT alter
+// an existing table, so without this an upgraded install keeps its old schema,
+// every query naming a new column throws, fail-open swallows it, and the whole
+// product silently returns "no sessions". That is exactly how this bug
+// presented in the wild — so migration runs before anything else touches the db.
+const MIGRATIONS = [
+  ['sessions', 'named', 'INTEGER DEFAULT 0'],
+  ['sessions', 'alias', 'TEXT'],
+  ['sessions', 'synthetic', 'INTEGER DEFAULT 0'],
+  ['claims', 'observed', 'INTEGER DEFAULT 1'],
+  ['claims', 'reason', 'TEXT'],
+  ['events', 'detail', 'TEXT'],
+  ['events', 'workspace', 'TEXT'],
+];
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -27,7 +42,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   last_seen   INTEGER,
   status      TEXT,              -- active | idle | ended
   intent      TEXT,
-  synthetic   INTEGER DEFAULT 0  -- 1 = pid-derived id, may be merged into a real one
+  synthetic   INTEGER DEFAULT 0, -- 1 = pid-derived id, may be merged into a real one
+  named       INTEGER DEFAULT 0, -- 1 = a semantic name was derived; never re-derive
+  alias       TEXT               -- the agent's OWN session name, e.g. Claude Code's logline2-b2
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_ws   ON sessions(workspace, status);
 CREATE INDEX IF NOT EXISTS idx_sessions_link ON sessions(link_key);
@@ -82,6 +99,18 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attach_ws ON attachments(workspace, consumed_by, expires_at);
 
+-- Sessions this session is actively REFERENCING. Once you @tag a session it
+-- stays referenced, so later turns get its updates without you re-tagging.
+CREATE TABLE IF NOT EXISTS refs (
+  session_id  TEXT NOT NULL,      -- the session doing the referencing
+  target_id   TEXT NOT NULL,
+  workspace   TEXT,
+  created_at  INTEGER,
+  last_seen   INTEGER,            -- target's digest timestamp at last injection
+  PRIMARY KEY (session_id, target_id)
+);
+CREATE INDEX IF NOT EXISTS idx_refs_ws ON refs(workspace, session_id);
+
 CREATE TABLE IF NOT EXISTS events (
   ts          INTEGER,
   session_id  TEXT,
@@ -118,6 +147,7 @@ class Store {
       this.db.exec('PRAGMA busy_timeout=50');   // ADR-5: give up fast, never hang a hook
       this.db.exec('PRAGMA synchronous=NORMAL');
       this.db.exec(SCHEMA);
+      this.migrate();
       try { this.db.exec(FTS_SCHEMA); this.fts = true; } catch { this.fts = false; }
       this.db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)')
         .run('schema_version', String(SCHEMA_VERSION));
@@ -129,17 +159,41 @@ class Store {
     }
   }
 
+  // Bring an older database up to the current schema. Additive only: every
+  // migration is an ALTER TABLE ADD COLUMN, so it cannot lose data and is safe
+  // to run on every open.
+  migrate() {
+    for (const [table, column, type] of MIGRATIONS) {
+      try {
+        const cols = this.db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+        if (!cols.length || cols.includes(column)) continue;
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+        this.migrated = (this.migrated || []).concat(`${table}.${column}`);
+      } catch { /* a single failed migration must not stop the others */ }
+    }
+  }
+
+  // Schema drift is the one class of error we must NOT swallow silently: it
+  // makes the product return empty results while looking healthy. Surface it
+  // so `doctor` can report it, then keep failing open for the caller.
+  _note(e) {
+    if (e && /no such column|no such table/i.test(e.message || '')) {
+      this.schemaError = e.message;
+    }
+    return null;
+  }
+
   _run(sql, ...args) {
     if (!this.ok) return null;
-    try { return this.db.prepare(sql).run(...args); } catch { return null; }
+    try { return this.db.prepare(sql).run(...args); } catch (e) { return this._note(e); }
   }
   _all(sql, ...args) {
     if (!this.ok) return [];
-    try { return this.db.prepare(sql).all(...args); } catch { return []; }
+    try { return this.db.prepare(sql).all(...args); } catch (e) { this._note(e); return []; }
   }
   _get(sql, ...args) {
     if (!this.ok) return null;
-    try { return this.db.prepare(sql).get(...args) ?? null; } catch { return null; }
+    try { return this.db.prepare(sql).get(...args) ?? null; } catch (e) { return this._note(e); }
   }
 
   // ---- sessions -----------------------------------------------------------
@@ -165,23 +219,25 @@ class Store {
       status:     s.status     ?? prev?.status     ?? 'active',
       intent:     s.intent     ?? prev?.intent     ?? null,
       // Once a session is known by a real id it never reverts to synthetic.
+      named:      s.named ?? prev?.named ?? 0,
+      alias:      s.alias ?? prev?.alias ?? null,
       synthetic:  prev?.synthetic === 0 ? 0
                 : s.synthetic === undefined ? (prev?.synthetic ?? 0)
                 : (s.synthetic ? 1 : 0),
     };
     this._run(
       `INSERT INTO sessions
-         (session_id,link_key,pid,agent_pid,name,agent,agent_ver,tier,cwd,workspace,started_at,last_seen,status,intent,synthetic)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         (session_id,link_key,pid,agent_pid,name,agent,agent_ver,tier,cwd,workspace,started_at,last_seen,status,intent,synthetic,named,alias)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(session_id) DO UPDATE SET
          link_key=excluded.link_key, pid=excluded.pid, agent_pid=excluded.agent_pid,
          name=excluded.name, agent=excluded.agent, agent_ver=excluded.agent_ver,
          tier=excluded.tier, cwd=excluded.cwd, workspace=excluded.workspace,
          last_seen=excluded.last_seen, status=excluded.status, intent=excluded.intent,
-         synthetic=excluded.synthetic`,
+         synthetic=excluded.synthetic, named=excluded.named, alias=excluded.alias`,
       merged.session_id, merged.link_key, merged.pid, merged.agent_pid, merged.name,
       merged.agent, merged.agent_ver, merged.tier, merged.cwd, merged.workspace,
-      merged.started_at, merged.last_seen, merged.status, merged.intent, merged.synthetic
+      merged.started_at, merged.last_seen, merged.status, merged.intent, merged.synthetic, merged.named, merged.alias
     );
     return merged;
   }
@@ -203,15 +259,13 @@ class Store {
   // FR-2.1 / FR-2.2: live peers in this workspace, excluding self.
   // Liveness is (status != ended) AND heartbeat within ttl AND pid alive.
   livePeers(workspace, selfId, ttlMs) {
-    const cutoff = Date.now() - ttlMs;
     const rows = this._all(
       `SELECT * FROM sessions
         WHERE workspace = ? AND session_id != COALESCE(?, '') AND status != 'ended'
-          AND last_seen >= ?
         ORDER BY last_seen DESC`,
-      workspace, selfId ?? '', cutoff
+      workspace, selfId ?? ''
     );
-    const alive = rows.filter(r => isPidAlive(r.agent_pid ?? r.pid));
+    const alive = rows.filter(r => isSessionLive(r, ttlMs, this.staleMs));
 
     // §11.7 — the MCP server and the hooks can each register the SAME agent
     // session: the server only knows the agent's pid, the hooks know its real
@@ -230,12 +284,10 @@ class Store {
   // FR-2.4: reap sessions whose process is gone or whose heartbeat lapsed,
   // and release their claims. A dead session's claim must never block (FR-2.5).
   reap(ttlMs) {
-    const cutoff = Date.now() - ttlMs;
-    const rows = this._all("SELECT session_id, agent_pid, pid, last_seen FROM sessions WHERE status != 'ended'");
+    const rows = this._all("SELECT session_id, status, agent_pid, pid, last_seen FROM sessions WHERE status != 'ended'");
     let reaped = 0;
     for (const r of rows) {
-      const dead = !isPidAlive(r.agent_pid ?? r.pid) || r.last_seen < cutoff;
-      if (dead) { this.endSession(r.session_id); reaped++; }
+      if (!isSessionLive(r, ttlMs, this.staleMs)) { this.endSession(r.session_id); reaped++; }
     }
     this._run('DELETE FROM claims WHERE expires_at < ?', Date.now());
     return reaped;
@@ -367,14 +419,13 @@ class Store {
         WHERE workspace = ? AND session_id != COALESCE(?, '') AND last_seen > ?
         ORDER BY last_seen DESC LIMIT 40`,
       workspace, selfId ?? '', Date.now() - maxAgeMs);
-    const cutoff = Date.now() - ttlMs;
     const mergeKey = r => `${r.agent || '?'}|${r.link_key}`;
     const realKeys = new Set(rows.filter(r => !r.synthetic && r.link_key).map(mergeKey));
     return rows
       .filter(r => !(r.synthetic && r.link_key && realKeys.has(mergeKey(r))))
       .map(r => ({
         ...r,
-        live: r.status !== 'ended' && r.last_seen >= cutoff && isPidAlive(r.agent_pid ?? r.pid),
+        live: isSessionLive(r, ttlMs, this.staleMs),
       }));
   }
 
@@ -413,8 +464,7 @@ class Store {
   transferClaims(fromId, toId, ttlMs) {
     const from = this.getSession(fromId);
     if (!from) return 0;
-    const live = from.status !== 'ended' && isPidAlive(from.agent_pid ?? from.pid);
-    if (live) return 0;
+    if (isSessionLive(from, 120_000, this.staleMs)) return 0;
     const claims = this._all('SELECT * FROM claims WHERE session_id=?', fromId);
     for (const c of claims) {
       this.addClaim({ path: c.path, session_id: toId, workspace: c.workspace,
@@ -427,6 +477,29 @@ class Store {
   notesBySession(sessionId, limit = 20) {
     return this._all('SELECT * FROM notes WHERE session_id=? ORDER BY created_at DESC LIMIT ?',
       sessionId, limit);
+  }
+
+  // ---- active references --------------------------------------------------
+
+  addRef(sessionId, targetId, workspace, targetStamp) {
+    const now = Date.now();
+    this._run(`INSERT INTO refs(session_id,target_id,workspace,created_at,last_seen)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(session_id,target_id) DO UPDATE SET last_seen=excluded.last_seen`,
+      sessionId, targetId, workspace, now, targetStamp ?? now);
+  }
+
+  refsFor(sessionId) {
+    return this._all('SELECT * FROM refs WHERE session_id=? ORDER BY created_at', sessionId);
+  }
+
+  touchRef(sessionId, targetId, stamp) {
+    this._run('UPDATE refs SET last_seen=? WHERE session_id=? AND target_id=?', stamp, sessionId, targetId);
+  }
+
+  clearRefs(sessionId, targetId) {
+    if (targetId) this._run('DELETE FROM refs WHERE session_id=? AND target_id=?', sessionId, targetId);
+    else this._run('DELETE FROM refs WHERE session_id=?', sessionId);
   }
 
   // ---- events (local-only effectiveness telemetry, §14) -------------------
@@ -457,16 +530,34 @@ function ftsEscape(q) {
 }
 
 function isPidAlive(pid) {
+  // pid 0/1 is never a live agent: 1 means the real parent exited and the
+  // process was reparented to init, i.e. the agent we care about is gone.
+  if (pid !== undefined && pid !== null && pid <= 1) return false;
   if (!pid) return true;              // unknown pid: don't reap on missing data
   try { process.kill(pid, 0); return true; }
   catch (e) { return e.code === 'EPERM'; }  // EPERM = alive but not ours
 }
 
-function isPidAliveForSession(store, sessionId) {
-  const s = store.getSession(sessionId);
-  if (!s) return false;
-  if (s.status === 'ended') return false;
-  return isPidAlive(s.agent_pid ?? s.pid);
+// The single definition of "this session is still going", used everywhere.
+//
+// The process being alive is AUTHORITATIVE. An earlier version required a
+// heartbeat within 120s, which meant a session sitting idle — you reading, or
+// thinking, or away for coffee — silently dropped out of the roster and lost
+// its sbs handle to the next session that started. Hooks only fire when you
+// act, so "hasn't acted recently" is not remotely the same as "gone".
+//
+// The heartbeat is now only a fallback for when we have no pid, plus a very
+// generous staleness bound so a recycled pid can't resurrect an ancient row.
+function isSessionLive(row, ttlMs, staleMs) {
+  if (!row || row.status === 'ended') return false;
+  const age = Date.now() - (row.last_seen ?? 0);
+  const pid = row.agent_pid ?? row.pid;
+  if (pid) return isPidAlive(pid) && age < (staleMs ?? 12 * 3600_000);
+  return age < (ttlMs ?? 120_000);
 }
 
-module.exports = { Store, SCHEMA_VERSION, isPidAlive, ftsEscape };
+function isPidAliveForSession(store, sessionId) {
+  return isSessionLive(store.getSession(sessionId), 120_000, store.staleMs);
+}
+
+module.exports = { Store, SCHEMA_VERSION, isPidAlive, isSessionLive, ftsEscape };

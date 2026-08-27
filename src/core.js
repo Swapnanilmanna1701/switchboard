@@ -37,34 +37,214 @@ function writeRoster(store, workspace) {
   } catch { return false; }
 }
 
+// How much the AMBIENT layer is allowed to spend. Nothing here changes what
+// you can pull on demand — only what arrives uninvited.
+//
+//   full  ~150 tok  the roster: who is live, what they're on, what they hold
+//   lean   ~18 tok  one line saying peers exist; the model pulls if it cares
+//   off       0 tok  nothing arrives unless a tool is called
+//
+// A model can only use what is in its context, so "know about peers for free"
+// is not achievable — but the FLOOR can be zero, and `lean` gets 88% of the
+// value for 12% of the cost.
+function readMode(workspace) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(require('node:path').join(W.storeDir(workspace), 'config.json'), 'utf8'));
+    return ['full', 'lean', 'off'].includes(cfg.mode) ? cfg.mode : 'full';
+  } catch { return 'full'; }
+}
+
+function writeMode(workspace, mode) {
+  const p = require('node:path').join(W.storeDir(workspace), 'config.json');
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { /* new */ }
+  cfg.mode = mode;
+  fs.mkdirSync(W.storeDir(workspace), { recursive: true });
+  fs.writeFileSync(p, `${JSON.stringify(cfg, null, 2)}\n`);
+  return p;
+}
+
 // The text injected at session start, already wrapped as untrusted data
 // (§13.8). Returns '' when there are no peers — FR-3.4, zero-cost path.
 function injectionText(store, workspace, selfId, opts = {}) {
+  const mode = opts.mode ?? readMode(workspace);
+  if (mode === 'off') return { text: '', tokens: 0, peers: 0, mode };
+
   const ctx = rosterContext(store, workspace, selfId, opts.ttlMs ?? W.DEFAULTS.liveTtlMs);
-  if (!ctx.peers.length) return { text: '', tokens: 0, peers: 0 };
+  if (!ctx.peers.length) return { text: '', tokens: 0, peers: 0, mode };
+
+  if (mode === 'lean') {
+    // A pointer, not a payload. The model spends the rest only if it decides
+    // the peers matter — ADR-1 taken to its limit.
+    //
+    // No untrusted-data envelope here: this line contains a COUNT and nothing
+    // a peer wrote, so there is no injected content to defend against. The
+    // envelope is ~50 tokens and would be most of the cost of the mode whose
+    // entire purpose is being cheap.
+    const n = ctx.peers.length;
+    const text = `[switchboard] ${n} other session${n === 1 ? '' : 's'} live in this workspace. ` +
+                 'Call sb_peers if that matters.';
+    return { text, tokens: D.estimateTokens(text), peers: n, mode };
+  }
+
   const body = D.renderRoster(ctx.peers, ctx, opts);
-  if (!body) return { text: '', tokens: 0, peers: ctx.peers.length };
+  if (!body) return { text: '', tokens: 0, peers: ctx.peers.length, mode };
   const text = D.wrapForInjection(body);
-  return { text, tokens: D.estimateTokens(text), peers: ctx.peers.length };
+  return { text, tokens: D.estimateTokens(text), peers: ctx.peers.length, mode };
 }
 
 // One registration path for every agent, whether the caller is the MCP server
 // (ADR-0) or a hook. `tier` is max()'d in the store, so a hook upgrading a
 // session from T1 to T3 never gets downgraded by a later MCP heartbeat.
 function registerSession(store, {
-  session_id, cwd, workspace, agent, agent_ver, name, tier, agent_pid, intent, status, synthetic,
+  session_id, cwd, workspace, agent, agent_ver, name, alias, tier, agent_pid, intent, status, synthetic,
 }) {
-  return store.upsertSession({
+  const out = store.upsertSession({
     session_id,
     link_key: W.linkKey(cwd, agent_pid),
     pid: process.pid,
     agent_pid,
-    name, agent, agent_ver, tier, synthetic,
+    name, alias, agent, agent_ver, tier, synthetic,
     cwd, workspace,
     started_at: Date.now(),
     status: status ?? 'active',
     intent: intent ? D.redact(D.truncate(D.collapse(intent), 200)) : null,
   });
+  return out;
+}
+
+// ---- @mentions -------------------------------------------------------------
+
+// Pull candidate @tags out of a prompt: @fix-auth-tokens, @logline2-d1.
+// Deliberately permissive here and strict at resolution time — a tag that
+// doesn't match a real session injects NOTHING, so an email address or a
+// decorator in pasted code can never trigger a false injection.
+function parseMentions(prompt) {
+  const out = [];
+  const re = /(^|[\s(\[{,'"`])@([A-Za-z0-9][A-Za-z0-9._-]{0,63})/g;
+  let m;
+  while ((m = re.exec(String(prompt || '')))) out.push(m[2]);
+  return [...new Set(out)];
+}
+
+// Resolve @tags to sessions. Only exact matches count: the session's name,
+// the agent's own name for it, or its id. No prefix guessing — silently
+// injecting the wrong session's context would be worse than doing nothing.
+function resolveMentions(store, workspace, prompt, selfId) {
+  const tags = parseMentions(prompt);
+  if (!tags.length) return [];
+  const all = store.attachCandidates(workspace, selfId, W.DEFAULTS.liveTtlMs);
+  const hits = [];
+  for (const tag of tags) {
+    const want = tag.toLowerCase();
+    const found = all.find(s => (s.name || '').toLowerCase() === want)
+      || all.find(s => (s.alias || '').toLowerCase() === want)   // native @ typeahead
+      || all.find(s => s.session_id.toLowerCase() === want)
+      || null;
+    if (found && !hits.some(h => h.session.session_id === found.session_id)) {
+      hits.push({ tag, session: found });
+    }
+  }
+  return hits;
+}
+
+// The full directory: every session in this workspace, live and ended, with
+// its handle. Backs bare `/sbs` and `@sbs` — look before you act.
+// Live sessions only, unless `all` is asked for. An ended session is still
+// attachable, but a list dominated by yesterday's corpses is noise — you
+// almost always mean "what is running right now".
+function sessionIndex(store, workspace, selfId, opts = {}) {
+  const D2 = require('./digest');
+  let sessions = store.attachCandidates(workspace, selfId, W.DEFAULTS.liveTtlMs, opts.maxAgeMs);
+  const endedCount = sessions.filter(s => !s.live).length;
+  if (!opts.all) sessions = sessions.filter(s => s.live);
+  const claimsBySession = {};
+  const digestBySession = {};
+  for (const s of sessions) {
+    claimsBySession[s.session_id] = store.claimsFor(s.session_id);
+    digestBySession[s.session_id] = store.getDigest(s.session_id);
+  }
+  const body = D2.renderSessionIndex(sessions, { workspace, claimsBySession, digestBySession, endedCount, all: !!opts.all }, opts);
+  return { body, sessions, endedCount, text: D2.wrapForInjection(body), tokens: D2.estimateTokens(body) };
+}
+
+// Build the context block for every @mentioned session in one prompt.
+function mentionText(store, workspace, prompt, selfId, opts = {}) {
+  // "@sbs stop" / "@sbs clear" drops every active reference. A sticky
+  // reference you cannot turn off is a leak, not a feature.
+  if (/@sbs\s+(stop|clear|off|none)\b/i.test(String(prompt || ''))) {
+    const n = store.refsFor(selfId).length;
+    store.clearRefs(selfId);
+    return { text: '', tokens: 0, tags: ['sbs'], cleared: n };
+  }
+
+  // Bare `@sbs` means "show me the index", not "resolve a session".
+  if (parseMentions(prompt).some(t => /^sbs$/i.test(t))) {
+    const idx = sessionIndex(store, workspace, selfId, opts);
+    return { text: idx.text, tokens: idx.tokens, tags: ['sbs'], index: true };
+  }
+
+  const hits = resolveMentions(store, workspace, prompt, selfId);
+  if (!hits.length) return { text: '', tokens: 0, tags: [] };
+
+  const D2 = require('./digest');
+  const per = Math.max(200, Math.floor((opts.maxTokens ?? 1200) / hits.length));
+  const blocks = hits.map(({ tag, session }) => {
+    const ctx = attachContext(store, workspace, session.session_id);
+    return `@${tag}:\n${D2.renderSessionDetail(ctx, { maxTokens: per })}`;
+  });
+
+  const body = `You referenced ${hits.length} session${hits.length === 1 ? '' : 's'} by @tag:\n\n${blocks.join('\n\n')}`;
+  const text = D2.wrapForInjection(body);
+  return { text, tokens: D2.estimateTokens(text), tags: hits.map(h => h.tag), hits };
+}
+
+// ---- active (sticky) references --------------------------------------------
+
+// Once you @tag a session, it stays REFERENCED. Later turns pick up whatever
+// that session has done since, without you re-typing the tag — the point of a
+// reference is that it persists, otherwise it is just a one-off lookup.
+function rememberRefs(store, workspace, sessionId, hits) {
+  for (const { session } of hits) {
+    const d = store.getDigest(session.session_id);
+    store.addRef(sessionId, session.session_id, workspace, d?.updated_at ?? 0);
+  }
+}
+
+// What has changed in the sessions this one references, since we last said so.
+// Silent when nothing moved — a reference that chatters every turn is worse
+// than no reference at all.
+function refDelta(store, workspace, sessionId, opts = {}) {
+  const refs = store.refsFor(sessionId);
+  if (!refs.length) return { text: '', tokens: 0, changed: [] };
+
+  const D2 = require('./digest');
+  const changed = [];
+  for (const r of refs) {
+    const target = store.getSession(r.target_id);
+    if (!target || target.status === 'ended') continue;
+    const d = store.getDigest(r.target_id);
+    const stamp = d?.updated_at ?? 0;
+    if (stamp <= (r.last_seen ?? 0)) continue;          // nothing new
+    changed.push({ target, digest: d, stamp });
+  }
+  if (!changed.length) return { text: '', tokens: 0, changed: [] };
+
+  const per = Math.max(120, Math.floor((opts.maxTokens ?? 400) / changed.length));
+  const blocks = changed.map(({ target, digest }) => {
+    const nm = target.name || target.session_id.slice(0, 8);
+    const bits = [];
+    if (digest?.last_msg) bits.push(digest.last_msg);
+    const claims = store.claimsFor(target.session_id);
+    if (claims.length) bits.push(`now on: ${claims.slice(0, 3).map(c => D2.relTo(workspace, c.path)).join(', ')}`);
+    return D2.capText(`• ${nm} — ${bits.join(' · ') || 'still working'}`, per);
+  });
+
+  for (const { target, stamp } of changed) store.touchRef(sessionId, target.session_id, stamp);
+
+  const body = `Update from the session${changed.length === 1 ? '' : 's'} you are referencing:\n${blocks.join('\n')}`;
+  const text = D2.wrapForInjection(body);
+  return { text, tokens: D2.estimateTokens(text), changed };
 }
 
 // Resolve the identity a session should be stored under.
@@ -101,6 +281,85 @@ function deriveName(agent, workspace, sessionId) {
   return `${base}-${short}`;
 }
 
+// ---- semantic naming -------------------------------------------------------
+
+// Words that carry no signal about what a session is FOR.
+const STOP = new Set(`
+a an the this that these those my our your its их
+and or but so then than also just only very really quite
+i we you it they he she them us me
+is are was were be been being am do does did done doing
+have has had having can could should would will shall may might must
+to of in on at for from with by about into over under across as
+please help lets let me us can you could would need want try trying
+some any all every each other another new old current
+thing things stuff code file files project repo repository
+`.trim().split(/\s+/));
+
+// A short, meaningful name built from what the session is actually doing.
+// Mechanical, not an LLM call (ADR-2): this runs inside a hook with a 300ms
+// budget, and a name is not worth a model round-trip.
+function deriveLabel(intent, files = []) {
+  const words = String(intent || '')
+    .toLowerCase()
+    .replace(/[`"'*_~]/g, '')
+    .replace(/[^a-z0-9+#./-]+/g, ' ')
+    .split(/\s+/)
+    .map(w => w.replace(/^[./-]+|[./-]+$/g, ''))
+    .filter(w => w.length > 1 && w.length < 20 && !STOP.has(w));
+
+  const picked = [];
+  for (const w of words) {
+    if (picked.includes(w)) continue;
+    picked.push(w);
+    if (picked.join('-').length >= 22 || picked.length >= 4) break;
+  }
+
+  if (picked.length) return picked.join('-').slice(0, 28).replace(/-+$/, '');
+
+  // No usable intent yet: name it after the file it is working in.
+  const f = files.find(Boolean);
+  if (f) {
+    const stem = require('node:path').basename(String(f)).replace(/\.[a-z0-9]+$/i, '');
+    if (stem) return `working-${stem}`.slice(0, 28);
+  }
+  return null;
+}
+
+// A one-line description for lists. Distinct from the name: the name is an
+// address, this is what it is for.
+function deriveDescription(intent, digest) {
+  const src = intent || digest?.intent || digest?.last_msg || '';
+  const s = D.collapse(src);
+  if (!s) return null;
+  // First sentence, if there is a natural one.
+  const first = s.split(/(?<=[.!?])\s+/)[0];
+  return D.truncate((first.length >= 15 ? first : s), 72);
+}
+
+// Assign a semantic name ONCE, the first time we learn what this session is
+// doing. Never renamed afterwards: a name that changes underneath the user
+// breaks every reference they have already made to it.
+function nameFromWork(store, sessionId, workspace, { intent, files } = {}) {
+  const cur = store.getSession(sessionId);
+  if (!cur || cur.named) return cur?.name ?? null;
+
+  const label = deriveLabel(intent ?? cur.intent, files);
+  if (!label) return cur.name;
+
+  // Two sessions can legitimately be doing the same thing; disambiguate rather
+  // than let sb_session("fix-auth") become a coin flip.
+  let name = label;
+  const taken = new Set(
+    store._all('SELECT name FROM sessions WHERE workspace=? AND session_id!=?', workspace, sessionId)
+      .map(r => (r.name || '').toLowerCase()));
+  let n = 2;
+  while (taken.has(name.toLowerCase())) name = `${label}-${n++}`;
+
+  store.upsertSession({ session_id: sessionId, name, named: 1 });
+  return name;
+}
+
 // ---- attach ----------------------------------------------------------------
 
 // Gather one session's ENTIRE recorded context, for an explicit takeover.
@@ -126,9 +385,15 @@ function findTarget(store, workspace, needle, selfId) {
   const want = String(needle || '').toLowerCase().trim();
   if (!want) return null;
   const all = store.attachCandidates(workspace, selfId, W.DEFAULTS.liveTtlMs);
+
   return all.find(s => (s.name || '').toLowerCase() === want)
+      // The agent's OWN session name: this is what Claude Code's native `@`
+      // typeahead inserts, so it must resolve even after we rename a session
+      // to something semantic.
+      || all.find(s => (s.alias || '').toLowerCase() === want)
       || all.find(s => s.session_id.toLowerCase() === want)
       || all.find(s => (s.name || '').toLowerCase().startsWith(want))
+      || all.find(s => (s.alias || '').toLowerCase().startsWith(want))
       || all.find(s => s.session_id.toLowerCase().startsWith(want))
       || null;
 }
@@ -183,4 +448,7 @@ module.exports = {
   openContext, rosterContext, writeRoster, injectionText,
   registerSession, resolveIdentity, deriveName, sweep, ensureStoreDir,
   attachContext, findTarget, performAttach,
+  parseMentions, resolveMentions, mentionText, sessionIndex,
+  rememberRefs, refDelta, readMode, writeMode,
+  deriveLabel, deriveDescription, nameFromWork,
 };
