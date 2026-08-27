@@ -173,7 +173,7 @@ function doctor() {
   line('store writable', store.ok, store.ok ? '' : store.error?.message);
   if (!store.ok) problems++;
   // A silently-empty store looks identical to a healthy one, so say it loudly.
-  store._all('SELECT session_id, slot, synthetic FROM sessions LIMIT 1');
+  store._all('SELECT session_id, name, named, synthetic FROM sessions LIMIT 1');
   line('schema up to date', !store.schemaError, store.schemaError || '');
   if (store.schemaError) { problems++; console.log(`    ${c.y('run `switchboard purge` to rebuild the store')}`); }
   if (store.migrated?.length) console.log(`  ${c.g('✓')} ${pad('migrated this run', 32)} ${c.dim(store.migrated.join(', '))}`);

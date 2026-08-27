@@ -1428,6 +1428,21 @@ test('only sessions from THIS workspace ever appear', () => {
   store.close();
 });
 
+// Findings are the most sensitive thing stored — a note that crosses repos
+// leaks one project's internals into another's context window.
+test('notes never cross workspaces, by search or by recency', () => {
+  const { store, ws } = freshStore('scope-notes');
+  store.addNote({ session_id: 'mine',    workspace: ws,           text: 'kestrel timeout is the culprit' });
+  store.addNote({ session_id: 'foreign', workspace: '/other/repo', text: 'kestrel timeout is the culprit' });
+
+  assert.deepEqual(store.searchNotes(ws, 'kestrel').map(n => n.session_id), ['mine'],
+    'search must not reach into another repo');
+  assert.deepEqual(store.recentNotes(ws).map(n => n.session_id), ['mine'],
+    'the recent-notes feed must not reach into another repo');
+  assert.equal(store.searchNotes('/other/repo', 'kestrel').length, 1, 'and the isolation is symmetric');
+  store.close();
+});
+
 test('the index shows LIVE only, and says how many ended are hidden', () => {
   const { store, ws } = freshStore('liveonly');
   store.upsertSession({ session_id: 'live', workspace: ws, agent_pid: process.pid, name: 'still-running', agent: 'claude-code' });
@@ -1573,7 +1588,7 @@ test('you cannot @tag yourself into your own context', () => {
   const { ws, store } = twoSessions('at-m5');
   const me = store.getSession('ME');
   const out = H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'ME', cwd: ws,
-    user_input: `what about @sbs${me.slot}?` }, { agent: CC }).output;
+    user_input: `what about @${me.name}?` }, { agent: CC }).output;
   assert.ok(!out || !out.includes('referenced'), 'self-reference is a no-op');
   store.close();
 });
