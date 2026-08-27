@@ -1,0 +1,20 @@
+# Switchboard's own runtime state. Contains distilled session content —
+# file paths, commands, findings — and must never be committed or published.
+.switchboard/
+*.db
+*.db-wal
+*.db-shm
+
+# Agent configs written by `switchboard init` when developing against itself
+.mcp.json
+.claude/
+.cursor/
+.gemini/
+.vscode/
+.cline/
+.opencode/
+
+node_modules/
+npm-debug.log*
+.DS_Store
+*.tmp

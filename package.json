@@ -1,0 +1,24 @@
+{
+  "name": "switchboard",
+  "version": "0.1.0",
+  "description": "Ambient shared working memory for concurrent AI coding sessions in one workspace.",
+  "type": "commonjs",
+  "bin": {
+    "switchboard": "bin/switchboard.js",
+    "switchboard-mcp": "bin/switchboard-mcp.js",
+    "switchboard-hook": "bin/switchboard-hook.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "dependencies": {},
+  "license": "MIT"
+}
