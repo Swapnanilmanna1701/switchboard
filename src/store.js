@@ -250,6 +250,10 @@ class Store {
   endSession(sessionId) {
     this._run("UPDATE sessions SET status='ended', last_seen=? WHERE session_id=?", Date.now(), sessionId);
     this._run('DELETE FROM claims WHERE session_id=?', sessionId);
+    // Drop it from the cross-repo index too, so `switchboard-adv` never offers
+    // a repo whose last session just closed. Required lazily to avoid a cycle:
+    // registry imports isPidAlive from this module.
+    try { require('./registry').forget(sessionId); } catch { /* best effort */ }
   }
 
   getSession(sessionId) {

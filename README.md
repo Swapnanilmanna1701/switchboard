@@ -23,6 +23,7 @@ npx switchboard init
 - [Referencing another session](#referencing-another-session)
 - [The `/sbs` picker](#the-sbs-picker)
 - [Continuing another session's work](#continuing-another-sessions-work)
+- [Scope: normal and advanced](#scope-normal-and-advanced)
 - [CLI reference](#cli-reference)
 - [MCP tools](#mcp-tools)
 - [Agent support](#agent-support)
@@ -46,8 +47,12 @@ session has claimed.
 **3. Shared findings.** One session posts a root cause; every later session can
 find it — including sessions started tomorrow.
 
-**4. Attach.** Pick any session, live or ended, and continue its work with its
-full context.
+**4. Attach.** Pick any live session and continue its work with its full
+context.
+
+By default a session can reach exactly one thing: **live sessions in its own
+repo**. Ended sessions and other repos are out of scope until you opt in — see
+[Scope](#scope-normal-and-advanced).
 
 A fresh session receives something like this automatically at startup:
 
@@ -152,12 +157,13 @@ Type `@` followed by a session name in any prompt:
 ```
 
 The referenced session's context is resolved and injected before your agent sees
-the prompt. Works for live *and* ended sessions.
+the prompt. In normal scope this resolves **live sessions in this repo only** —
+naming an ended session simply misses, rather than quietly resurrecting it.
 
 To see what names are available, run `/sbs` (below) or:
 
 ```bash
-npx switchboard sessions --all
+npx switchboard sessions
 ```
 
 ---
@@ -169,7 +175,7 @@ Type `/sbs` in an agent session, or run `npx switchboard sbs` in a terminal:
 ```
   switchboard  /Users/you/code/api
 
-  3 sessions · 2 live · 1 ended
+  2 sessions · 2 live · 0 ended
 
  fix-login-500-errors            [Claude Code]  live    4m
        debugging the login 500 errors
@@ -177,9 +183,6 @@ Type `/sbs` in an agent session, or run `npx switchboard sbs` in a terminal:
 
  restyle-checkout-form           [Cursor]       live   now
        components/Checkout.tsx
-
- migrate-user-table              [Claude Code]  ended   2h
-       migrating the users table to uuid keys
 
   ↑/↓ move · enter select · q or esc cancel
 ```
@@ -199,9 +202,12 @@ Select without the picker:
 
 ```bash
 npx switchboard sbs fix-login-500-errors
-npx switchboard sbs --all          # include ended sessions
 npx switchboard sbs <name> --run   # pick, then launch claude immediately
 ```
+
+The list is live sessions in this repo. `--all` widens it to ended sessions
+only in advanced scope — in normal scope it changes nothing, because an ended
+session isn't reachable and offering it would be a lie.
 
 ---
 
@@ -227,8 +233,82 @@ the current session can pick up where it left off.
 | `--adopt` | Also take over its file claims (ended sessions only) |
 | `--cancel` | Clear a queued attach |
 
-`--adopt` is deliberately restricted to ended sessions — taking over a live
-session's claims would defeat the collision guard.
+In normal scope you can attach to a **live** session in this repo. `--adopt` is
+restricted to ended sessions — taking over a live session's claims would defeat
+the collision guard — which in practice means it needs advanced scope, since
+that is the only place ended sessions are reachable.
+
+---
+
+## Scope: normal and advanced
+
+Scope controls what a session is allowed to reach at all. It is a different
+axis from mode, which only controls how many tokens the ambient layer spends.
+
+| | Normal (default) | Advanced |
+|---|---|---|
+| Live sessions, same repo | ✅ | ✅ |
+| Ended sessions | ❌ | ✅ |
+| Sessions in other repos | ❌ | ✅ |
+| How you get there | nothing to do | run `switchboard-adv` first |
+
+### Normal
+
+The default, and what you want almost always. A session sees **live sessions in
+its own repo, and nothing else**. Naming an ended session with `@` misses.
+`attach` won't find it. `--all` does not widen the list, because offering
+something you cannot reach is a lie.
+
+The past is not context. A session that finished made decisions against a
+codebase that has since moved.
+
+### Advanced
+
+For when work genuinely spans repos — an API and the web client that calls it,
+a service and its shared schema package.
+
+```bash
+cd ~/code/web
+npx switchboard-adv        # ← in a plain terminal, BEFORE starting your agent
+```
+
+Every repo with a live session is listed, sessions nested underneath:
+
+```
+  switchboard  advanced — connect across repos
+
+  2 repos open · 3 live sessions
+
+  api  /Users/you/code/api
+      fix-kestrel-timeout      [Claude Code]  live    2m
+      migrate-user-table       [Cursor]       live    8m
+
+  web  /Users/you/code/web  (this repo)
+      restyle-checkout-form    [Claude Code]  live   now
+
+  ↑/↓ move · enter connect · q or esc cancel
+```
+
+Arrow keys move between sessions, repo headings are skipped, Enter connects.
+The next agent session you start in that repo opens already holding the chosen
+session's context.
+
+```bash
+npx switchboard-adv --list      # show open repos, pick nothing
+npx switchboard-adv --status    # what's pending
+npx switchboard-adv --clear     # drop it, back to normal scope
+```
+
+**Why a separate command run beforehand.** Three properties fall out of that
+ordering, and all three are the point:
+
+- Crossing a repo boundary is always a human keystroke — never a config file
+  that drifted, never a model deciding it would be useful.
+- Browsing costs zero tokens. The picker runs in your terminal; the model only
+  ever sees the one session you chose.
+- **The link is one-shot.** It applies to the next session started in that repo
+  and is consumed. It also expires after an hour — intent from two hours ago
+  isn't intent now. A connection you can't turn off would be a leak.
 
 ---
 
@@ -245,6 +325,8 @@ npx switchboard doctor
 npx switchboard statusline install|uninstall|status
 npx switchboard uninstall [--purge]
 npx switchboard purge
+
+npx switchboard-adv [--list] [--status] [--clear]
 ```
 
 | Command | What it does |
@@ -259,6 +341,7 @@ npx switchboard purge
 | `statusline` | Manage the `[switchboard]` status line badge |
 | `uninstall` | Remove configs (`--purge` also drops stored data) |
 | `purge` | Drop all stored data, keep configs |
+| `switchboard-adv` | Connect the next session here to one in another repo |
 
 | Flag | Meaning |
 |---|---|
@@ -365,13 +448,33 @@ Everything lives in `.switchboard/` inside the repo, which `init` adds to
 
 ```
 .switchboard/
-  switchboard.db      SQLite: sessions, claims, digests, notes, refs, events
+  state.db            SQLite: sessions, claims, digests, notes, refs, events
   ROSTER.md           plain-Markdown roster for agents without MCP
+  config.json         mode and scope
+  link.json           pending cross-repo link, if any (one-shot)
 ```
 
 Stored per session: a short intent line, file paths opened and touched, commands
 run, and notes explicitly posted. **Not** stored: prompts, model responses, or
 transcripts.
+
+### The one file outside your repo
+
+Advanced mode has to answer "which repos are open right now?" before it knows
+which repo you mean, so there is exactly one global file:
+
+```
+~/.switchboard/index.db     workspace path · session name · agent · pid · last_seen
+```
+
+That list is deliberately thin — **no intent, no file lists, no commands, no
+notes**. Content never leaves the repo it belongs to, so this file exposes
+directory names, not work. Only `switchboard-adv` reads it; normal scope never
+touches it. Rows are pruned on read when their process is gone or the directory
+no longer exists.
+
+Override its location with `SWITCHBOARD_HOME` if your home directory is
+read-only or sandboxed.
 
 Inspect exactly what's there before trusting it:
 
@@ -393,7 +496,14 @@ documented as imperfect. Don't rely on it to catch a novel credential format.
 
 **Cross-session content is treated as untrusted.** Context injected from another
 session is wrapped in an explicit envelope marking it as data, not instructions,
-so one session's notes can't be used to steer another.
+so one session's notes can't be used to steer another. This applies to
+cross-repo context too.
+
+**Repos are isolated by default, twice over.** Each repo has its own database —
+there is no shared store — and every query is additionally scoped by workspace,
+so even a shared file would not leak. Crossing that boundary requires running
+`switchboard-adv` in a terminal, and the resulting link is one-shot and expires
+in an hour.
 
 **Never commit `.switchboard/`.** It holds distilled session content — file
 paths, commands, findings. `init` excludes it for you; the shipped `.gitignore`
@@ -465,6 +575,7 @@ written to your real home directory.
 
 ```
 bin/switchboard.js             CLI entrypoint
+bin/switchboard-adv.js         cross-repo picker (advanced)
 bin/switchboard-mcp.js         MCP server (stdio)
 bin/switchboard-hook.js        hook receiver
 bin/switchboard-statusline.js  status line renderer
@@ -474,7 +585,8 @@ src/digest.js                  digests, redaction, rendering
 src/mcp.js                     JSON-RPC and the eight tools
 src/hook.js                    per-agent hook dialects
 src/installers.js              config writers for every agent
-src/picker.js                  arrow-key TUI
+src/picker.js                  arrow-key TUI, flat and nested
+src/registry.js                cross-repo index (~/.switchboard)
 src/workspace.js               workspace resolution, agent registry
 ```
 

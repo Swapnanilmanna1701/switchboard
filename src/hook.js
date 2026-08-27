@@ -176,6 +176,16 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
         });
         C.sweep(store, ws);
 
+        // A cross-repo link set by `switchboard-adv` outranks everything else:
+        // the user went to a terminal, browsed other repos and picked one
+        // before starting this session. That is the most explicit intent we
+        // will ever see. One-shot — consumeLink deletes it.
+        const link = C.consumeLink(ws);
+        if (link) {
+          const cross = C.crossRepoContext(link);
+          if (cross) { out = cross.text; break; }
+        }
+
         // An explicit `switchboard attach` beats the ambient roster: the user
         // asked for one specific session's work, so give them that instead of
         // a summary of everyone. One-shot — consumed here so it can never

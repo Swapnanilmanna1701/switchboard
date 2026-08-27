@@ -64,6 +64,95 @@ function writeMode(workspace, mode) {
   return p;
 }
 
+// SCOPE is a different axis from MODE. Mode is how many tokens the ambient
+// layer may spend; scope is what a session is allowed to reach at all.
+//
+//   normal    (default) live sessions, this repo only. An ended session is
+//             invisible and cannot be attached to — the past is not context.
+//   advanced  live sessions across every open repo. Opt-in per session, and
+//             only via `switchboard-adv` run in a terminal *before* the agent
+//             starts, so crossing a repo boundary is always a human decision.
+//
+// Defaulting to `normal` matters: cross-repo context is the kind of thing that
+// should never happen because a config file drifted.
+function readScope(workspace) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(require('node:path').join(W.storeDir(workspace), 'config.json'), 'utf8'));
+    return cfg.scope === 'advanced' ? 'advanced' : 'normal';
+  } catch { return 'normal'; }
+}
+
+function writeScope(workspace, scope) {
+  const p = require('node:path').join(W.storeDir(workspace), 'config.json');
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { /* new */ }
+  cfg.scope = scope === 'advanced' ? 'advanced' : 'normal';
+  fs.mkdirSync(W.storeDir(workspace), { recursive: true });
+  fs.writeFileSync(p, `${JSON.stringify(cfg, null, 2)}\n`);
+  return p;
+}
+
+// ---- cross-repo link (advanced) --------------------------------------------
+//
+// `switchboard-adv` runs in a terminal, picks a session in another repo, and
+// leaves this file behind. The next session that starts in this repo consumes
+// it exactly once. A file rather than a table because the two ends are in
+// different repos with different databases, and neither should write to the
+// other's store.
+const LINK_TTL_MS = 60 * 60_000;   // an hour: you either start the agent or you don't
+
+function linkPath(workspace) { return require('node:path').join(W.storeDir(workspace), 'link.json'); }
+
+function writeLink(workspace, target) {
+  const p = linkPath(workspace);
+  fs.mkdirSync(W.storeDir(workspace), { recursive: true });
+  fs.writeFileSync(p, `${JSON.stringify({ ...target, created_at: Date.now() }, null, 2)}\n`);
+  return p;
+}
+
+function readLink(workspace) {
+  try {
+    const link = JSON.parse(fs.readFileSync(linkPath(workspace), 'utf8'));
+    if (!link.workspace || !link.session_id) return null;
+    if (Date.now() - (link.created_at ?? 0) > LINK_TTL_MS) return null;  // stale intent is not intent
+    return link;
+  } catch { return null; }
+}
+
+// One-shot. Reading it consumes it, so a link never silently applies to a
+// second session you started for an unrelated reason.
+function consumeLink(workspace) {
+  const link = readLink(workspace);
+  try { fs.rmSync(linkPath(workspace), { force: true }); } catch { /* best effort */ }
+  return link;
+}
+
+// Pull the linked session's context out of ITS OWN repo store. This is the one
+// place switchboard reads across a repo boundary, and it is reachable only
+// after a human picked that session in a terminal.
+function crossRepoContext(link, opts = {}) {
+  if (!link) return null;
+  const { Store } = require('./store');
+  const D2 = require('./digest');
+  let store;
+  try {
+    store = new Store(W.storePath(link.workspace));
+    if (!store.ok) return null;
+    const session = store.getSession(link.session_id);
+    if (!session) return null;
+    const body = D2.renderAttachContext({
+      session: { ...session, live: true },
+      digest: store.getDigest(link.session_id),
+      claims: store.claimsFor(link.session_id),
+      notes:  store.notesBySession(link.session_id),
+      workspace: link.workspace,
+    }, { maxTokens: opts.maxTokens ?? 2000 });
+    const header = `[switchboard] connected to ${session.name || link.session_id} in ${link.workspace}\n`;
+    return { text: D2.wrapForInjection(header + body), body, session, workspace: link.workspace };
+  } catch { return null; }
+  finally { try { store?.close(); } catch { /* already closed */ } }
+}
+
 // The text injected at session start, already wrapped as untrusted data
 // (§13.8). Returns '' when there are no peers — FR-3.4, zero-cost path.
 function injectionText(store, workspace, selfId, opts = {}) {
@@ -110,6 +199,17 @@ function registerSession(store, {
     status: status ?? 'active',
     intent: intent ? D.redact(D.truncate(D.collapse(intent), 200)) : null,
   });
+  // Mirror the bare fact "this repo has a live session" into the cross-repo
+  // index so `switchboard-adv` can find it. Metadata only — never the intent,
+  // which stays in this repo's store. Best-effort: a failure here must not
+  // affect the session, so registry.record swallows its own errors.
+  if (out) {
+    require('./registry').record({
+      session_id, workspace, agent,
+      pid: agent_pid ?? process.pid,
+      name: out.name ?? name ?? null,
+    });
+  }
   return out;
 }
 
@@ -133,7 +233,10 @@ function parseMentions(prompt) {
 function resolveMentions(store, workspace, prompt, selfId) {
   const tags = parseMentions(prompt);
   if (!tags.length) return [];
-  const all = store.attachCandidates(workspace, selfId, W.DEFAULTS.liveTtlMs);
+  // Normal scope: a @tag can only ever resolve to a LIVE session in this repo.
+  // Naming an ended session must miss, not quietly resurrect it.
+  let all = store.attachCandidates(workspace, selfId, W.DEFAULTS.liveTtlMs);
+  if (readScope(workspace) !== 'advanced') all = all.filter(s => s.live);
   const hits = [];
   for (const tag of tags) {
     const want = tag.toLowerCase();
@@ -157,7 +260,10 @@ function sessionIndex(store, workspace, selfId, opts = {}) {
   const D2 = require('./digest');
   let sessions = store.attachCandidates(workspace, selfId, W.DEFAULTS.liveTtlMs, opts.maxAgeMs);
   const endedCount = sessions.filter(s => !s.live).length;
-  if (!opts.all) sessions = sessions.filter(s => s.live);
+  // `--all` only widens the list in advanced scope. In normal scope ended
+  // sessions are not reachable, so offering them in a picker would be a lie.
+  const advanced = readScope(workspace) === 'advanced';
+  if (!opts.all || !advanced) sessions = sessions.filter(s => s.live);
   const claimsBySession = {};
   const digestBySession = {};
   for (const s of sessions) {
@@ -384,7 +490,10 @@ function attachContext(store, workspace, targetId, opts = {}) {
 function findTarget(store, workspace, needle, selfId) {
   const want = String(needle || '').toLowerCase().trim();
   if (!want) return null;
-  const all = store.attachCandidates(workspace, selfId, W.DEFAULTS.liveTtlMs);
+  let all = store.attachCandidates(workspace, selfId, W.DEFAULTS.liveTtlMs);
+  // Normal scope cannot attach to an ended session, so it must not be findable
+  // by name either — otherwise attach fails somewhere deeper with a worse error.
+  if (readScope(workspace) !== 'advanced') all = all.filter(s => s.live);
 
   return all.find(s => (s.name || '').toLowerCase() === want)
       // The agent's OWN session name: this is what Claude Code's native `@`
@@ -449,6 +558,7 @@ module.exports = {
   registerSession, resolveIdentity, deriveName, sweep, ensureStoreDir,
   attachContext, findTarget, performAttach,
   parseMentions, resolveMentions, mentionText, sessionIndex,
-  rememberRefs, refDelta, readMode, writeMode,
+  rememberRefs, refDelta, readMode, writeMode, readScope, writeScope,
+  writeLink, readLink, consumeLink, crossRepoContext, linkPath,
   deriveLabel, deriveDescription, nameFromWork,
 };

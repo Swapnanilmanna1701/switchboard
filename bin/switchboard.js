@@ -178,6 +178,17 @@ function doctor() {
   if (store.schemaError) { problems++; console.log(`    ${c.y('run `switchboard purge` to rebuild the store')}`); }
   if (store.migrated?.length) console.log(`  ${c.g('✓')} ${pad('migrated this run', 32)} ${c.dim(store.migrated.join(', '))}`);
 
+  const scope = C.readScope(workspace);
+  const link = C.readLink(workspace);
+  console.log(`  ${scope === 'advanced' ? c.y('•') : c.g('✓')} ${pad('scope', 32)} ` +
+    (scope === 'advanced'
+      ? c.y('advanced — this repo can reach across repo boundaries')
+      : c.dim('normal — live sessions, this repo only')));
+  if (link) {
+    console.log(`  ${c.y('•')} ${pad('pending cross-repo link', 32)} ${c.dim(`${link.name || link.session_id} in ${link.workspace}`)}`);
+    console.log(`    ${c.dim('applies to the next session started here; clear it with `switchboard-adv --clear`')}`);
+  }
+
   console.log(`\n${c.b('Agent configuration')}`);
   const items = I.plan(workspace, { all: true });
   const byAgent = new Map();
@@ -238,6 +249,10 @@ function purge() {
   try {
     fs.rmSync(W.storeDir(workspace), { recursive: true, force: true });
     console.log(`${c.g('✓')} removed ${rel(W.storeDir(workspace))}`);
+    // Also withdraw this repo from the cross-repo index. Leaving it listed
+    // would let `switchboard-adv` offer sessions whose context we just deleted.
+    const n = require('../src/registry').forgetWorkspace(workspace);
+    if (n) console.log(`${c.g('✓')} withdrew ${n} session(s) from the cross-repo index`);
   } catch (e) { console.log(c.r(`purge failed: ${e.message}`)); }
 }
 
@@ -462,13 +477,21 @@ ${c.b('Usage')}
   npx switchboard init [--dry-run] [--all] [--local]
   npx switchboard status [--json] [--raw]
   npx switchboard sbs [name] [--run] [--all]  # picker, or select by name
-  npx switchboard sessions [--all]            # live sessions (--all adds ended)
+  npx switchboard sessions [--all]            # live sessions in THIS repo
   npx switchboard attach [name] [--list] [--adopt] [--cancel]
   npx switchboard board
   npx switchboard doctor
   npx switchboard statusline install|uninstall|status
   npx switchboard uninstall [--purge]
   npx switchboard purge
+
+${c.b('Cross-repo (advanced)')}
+  npx switchboard-adv                         # pick a session in ANOTHER repo
+  npx switchboard-adv --list|--status|--clear
+
+  Normal scope is live sessions, this repo only — ended sessions are not
+  reachable. Run switchboard-adv in a terminal BEFORE starting your agent to
+  connect the next session to one in another repo. Applies once, then expires.
 
 ${c.b('Flags')}
   --dry-run   show the plan, write nothing

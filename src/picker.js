@@ -138,4 +138,133 @@ function pickFallback(sessions, ctx, input, output) {
   });
 }
 
-module.exports = { pick };
+// ---- advanced: cross-repo nested picker ------------------------------------
+//
+// Same zero-token argument as `pick`, one level deeper: repos are headings,
+// their live sessions nest underneath, and only sessions are selectable —
+// a repo on its own is not something you can hold a conversation with.
+
+// Flatten the repo tree into display rows once, so navigation is a simple
+// index walk that skips headings rather than a tree traversal.
+function flatten(repos) {
+  const rows = [];
+  for (const r of repos) {
+    rows.push({ type: 'repo', repo: r });
+    for (const s of r.sessions) rows.push({ type: 'session', repo: r, session: s });
+  }
+  return rows;
+}
+
+function nestedRow(row, sel, width) {
+  if (row.type === 'repo') {
+    const n = row.repo.sessions.length;
+    const base = require('node:path').basename(row.repo.workspace);
+    return [`  ${c.bold}${base}${c.reset} ${c.dim}${row.repo.workspace}${c.reset}` +
+            ` ${c.dim}(${n} session${n === 1 ? '' : 's'})${c.reset}`];
+  }
+  const s = row.session;
+  const name = (s.name || s.session_id.slice(0, 8)).padEnd(30).slice(0, 30);
+  const agent = `[${W.agentLabel(s.agent)}]`.padEnd(14).slice(0, 14);
+  const age = D.fmtAge(Date.now() - s.last_seen).padStart(5);
+  const line = `      ${c.bold}${name}${c.reset} ${c.cyan}${agent}${c.reset} ${c.green}live${c.reset} ${c.dim}${age}${c.reset}`;
+  return [sel ? `${c.inv}${plain(line).padEnd(width - 1)}${c.reset}` : line];
+}
+
+function drawNested(rows, cursor, out, width, repos) {
+  const total = rows.filter(r => r.type === 'session').length;
+  const body = [
+    '',
+    `  ${c.bold}switchboard${c.reset} ${c.dim}advanced — connect across repos${c.reset}`,
+    `  ${c.dim}${repos.length} repo${repos.length === 1 ? '' : 's'} open · ${total} live session${total === 1 ? '' : 's'}${c.reset}`,
+    '',
+  ];
+  rows.forEach((r, i) => {
+    body.push(...nestedRow(r, i === cursor, width));
+    if (r.type === 'repo') return;
+    body.push('');
+  });
+  body.push(`  ${c.dim}↑/↓ move · ${c.reset}${c.bold}enter${c.reset}${c.dim} connect · q or esc cancel${c.reset}`);
+  out.write(`${ESC}[2J${ESC}[H${body.join('\n')}\n`);
+}
+
+// Resolves to {repo, session} or null.
+function pickNested(repos, { input = process.stdin, output = process.stdout } = {}) {
+  return new Promise(resolve => {
+    const rows = flatten(repos);
+    const selectable = rows.map((r, i) => (r.type === 'session' ? i : -1)).filter(i => i >= 0);
+    if (!selectable.length) return resolve(null);
+    if (!input.isTTY || !input.setRawMode) return resolve(pickNestedFallback(rows, selectable, input, output));
+
+    const width = Math.max(60, Math.min(output.columns || 100, 120));
+    let at = 0;                                  // index into `selectable`
+    readline.emitKeypressEvents(input);
+    input.setRawMode(true);
+    input.resume();
+    drawNested(rows, selectable[at], output, width, repos);
+
+    const done = value => {
+      input.setRawMode(false);
+      input.pause();
+      input.removeListener('keypress', onKey);
+      output.write(`${ESC}[2J${ESC}[H`);
+      resolve(value);
+    };
+
+    const onKey = (_str, key) => {
+      if (!key) return;
+      if (key.name === 'up' || key.name === 'k') at = (at - 1 + selectable.length) % selectable.length;
+      else if (key.name === 'down' || key.name === 'j') at = (at + 1) % selectable.length;
+      else if (key.name === 'home') at = 0;
+      else if (key.name === 'end') at = selectable.length - 1;
+      else if (key.name === 'return' || key.name === 'enter') {
+        const row = rows[selectable[at]];
+        return done({ repo: row.repo, session: row.session });
+      } else if (key.name === 'escape' || key.name === 'q' || (key.ctrl && key.name === 'c')) return done(null);
+      else return;
+      drawNested(rows, selectable[at], output, width, repos);
+    };
+
+    input.on('keypress', onKey);
+  });
+}
+
+function pickNestedFallback(rows, selectable, input, output) {
+  return new Promise(resolve => {
+    output.write(`\n  ${c.bold}switchboard advanced${c.reset} ${c.dim}— connect across repos${c.reset}\n\n`);
+    let n = 0;
+    const numbered = [];
+    for (const row of rows) {
+      if (row.type === 'repo') {
+        output.write(`  ${c.bold}${require('node:path').basename(row.repo.workspace)}${c.reset} ${c.dim}${row.repo.workspace}${c.reset}\n`);
+        continue;
+      }
+      n += 1;
+      numbered.push(row);
+      const s = row.session;
+      output.write(`    ${c.bold}${String(n).padStart(2)}${c.reset}. ${s.name || s.session_id.slice(0, 8)} ` +
+                   `${c.cyan}[${W.agentLabel(s.agent)}]${c.reset} ${c.dim}${D.fmtAge(Date.now() - s.last_seen)}${c.reset}\n`);
+    }
+
+    const rl = readline.createInterface({ input, output, terminal: false });
+    let answered = false;
+    const finish = v => { if (answered) return; answered = true; try { rl.close(); } catch { /* ignore */ } resolve(v); };
+    output.write(`\n  ${c.bold}Select 1-${n}${c.reset} ${c.dim}(or a name, blank to cancel):${c.reset} `);
+    rl.on('line', line => {
+      const ans = String(line).trim();
+      if (!ans) return finish(null);
+      const i = Number(ans);
+      if (Number.isInteger(i) && i >= 1 && i <= numbered.length) {
+        const row = numbered[i - 1];
+        return finish({ repo: row.repo, session: row.session });
+      }
+      const want = ans.toLowerCase().replace(/^@/, '');
+      const hit = numbered.find(r => (r.session.name || '').toLowerCase() === want)
+        || numbered.find(r => (r.session.name || '').toLowerCase().startsWith(want));
+      if (hit) return finish({ repo: hit.repo, session: hit.session });
+      output.write(`  ${c.yellow}no match for "${ans}"${c.reset}\n  Select 1-${n}: `);
+    });
+    rl.on('close', () => finish(null));
+  });
+}
+
+module.exports = { pick, pickNested, flatten };

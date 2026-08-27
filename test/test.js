@@ -45,12 +45,17 @@ for (const d of ['.codex', '.codeium/windsurf', '.config/zed']) {
   fs.mkdirSync(path.join(FAKE_HOME, d), { recursive: true });
 }
 const INSTALL_OPTS = { all: true, home: FAKE_HOME };
+// The cross-repo registry is reached from registerSession, far below any
+// options object, so it reads this env var instead. Without it the suite
+// writes a real ~/.switchboard/index.db.
+process.env.SWITCHBOARD_HOME = FAKE_HOME;
 
 // Snapshot user-scoped configs BEFORE any test runs, compare after. Checking
 // merely for the string "switchboard" would false-positive whenever the user
 // has legitimately installed it on this machine — what we care about is
 // whether the suite CHANGED anything.
-const HOME_WATCH = ['.codex/config.toml', '.codeium/windsurf/mcp_config.json', '.config/zed/settings.json'];
+const HOME_WATCH = ['.codex/config.toml', '.codeium/windsurf/mcp_config.json', '.config/zed/settings.json',
+  '.switchboard/index.db'];
 const homeBefore = new Map(HOME_WATCH.map(p => {
   const f = path.join(os.homedir(), p);
   return [f, fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : null];
@@ -1443,6 +1448,114 @@ test('notes never cross workspaces, by search or by recency', () => {
   store.close();
 });
 
+// ---- cross-repo registry ---------------------------------------------------
+
+test('the registry groups live sessions by repo, newest repo first', () => {
+  const R = require('../src/registry');
+  R.clear();
+  const a = tmpWs('reg-a'), b = tmpWs('reg-b');
+  const t0 = Date.now();
+  R.record({ session_id: 'a1', workspace: a, name: 'fix-auth',  agent: 'claude-code', pid: process.pid, at: t0 });
+  R.record({ session_id: 'a2', workspace: a, name: 'fix-tests', agent: 'cursor',      pid: process.pid, at: t0 + 10 });
+  R.record({ session_id: 'b1', workspace: b, name: 'restyle',   agent: 'claude-code', pid: process.pid, at: t0 + 20 });
+
+  const repos = R.openRepos();
+  assert.equal(repos.length, 2, 'one entry per repo, not per session');
+  assert.equal(repos[0].workspace, b, 'most recently active repo leads');
+  const byWs = Object.fromEntries(repos.map(r => [r.workspace, r.sessions.length]));
+  assert.equal(byWs[a], 2, 'both of that repo\'s sessions nest under it');
+  assert.equal(R.openRepos({ excludeSession: 'b1' }).length, 1, 'you are never offered yourself');
+  R.clear();
+});
+
+test('the registry stores metadata only — never the work', () => {
+  const R = require('../src/registry');
+  R.clear();
+  const ws = tmpWs('reg-thin');
+  R.record({ session_id: 's1', workspace: ws, name: 'fix-auth', agent: 'claude-code', pid: process.pid });
+  const cols = R.openRepos()[0].sessions[0];
+  assert.deepEqual(Object.keys(cols).sort(),
+    ['agent', 'last_seen', 'name', 'pid', 'session_id', 'workspace'].sort(),
+    'intent, files, commands and notes must never reach the global index');
+  R.clear();
+});
+
+test('the registry drops dead sessions and vanished repos on read', () => {
+  const R = require('../src/registry');
+  R.clear();
+  const live = tmpWs('reg-live');
+  const doomed = tmpWs('reg-doomed');
+  R.record({ session_id: 'ok',   workspace: live,   name: 'alive', agent: 'claude-code', pid: process.pid });
+  R.record({ session_id: 'dead', workspace: live,   name: 'dead',  agent: 'claude-code', pid: 999999 });
+  R.record({ session_id: 'orph', workspace: doomed, name: 'orph',  agent: 'claude-code', pid: process.pid });
+  fs.rmSync(doomed, { recursive: true, force: true });
+
+  const repos = R.openRepos();
+  assert.equal(repos.length, 1, 'a repo that no longer exists must not be offered');
+  assert.deepEqual(repos[0].sessions.map(s => s.session_id), ['ok'], 'a dead pid is not a live session');
+  R.clear();
+});
+
+// ---- advanced: cross-repo linking ------------------------------------------
+
+test('a cross-repo link injects the other repo\'s session at SessionStart', () => {
+  const R = require('../src/registry');
+  R.clear();
+  const far = tmpWs('adv-far'), here = tmpWs('adv-here');
+
+  // A real session doing real work in the FAR repo.
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'FAR', cwd: far }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'FAR', cwd: far,
+    user_input: 'tracking down the kestrel timeout' }, { agent: CC });
+  const farStore = new Store(W.storePath(far));
+  const farName = farStore.getSession('FAR').name;
+  farStore.close();
+
+  // What `switchboard-adv` leaves behind after you pick.
+  C.writeLink(here, { workspace: far, session_id: 'FAR', name: farName, agent: 'claude-code' });
+  C.writeScope(here, 'advanced');
+
+  const out = H.handle({ hook_event_name: 'SessionStart', session_id: 'NEW', cwd: here }, { agent: CC }).output;
+  assert.ok(out, 'the linked session must arrive at startup');
+  assert.ok(out.includes(far), 'and say which repo it came from');
+  assert.ok(/kestrel timeout/.test(out), 'carrying that session\'s actual work');
+
+  // One-shot: a second session started here must NOT inherit the link.
+  assert.equal(C.readLink(here), null, 'the link is consumed, not sticky');
+  const again = H.handle({ hook_event_name: 'SessionStart', session_id: 'NEW2', cwd: here }, { agent: CC }).output;
+  assert.ok(!again || !/kestrel timeout/.test(again), 'a link must never apply twice');
+  R.clear();
+});
+
+test('a stale link is ignored rather than applied late', () => {
+  const here = tmpWs('adv-stale'), far = tmpWs('adv-stale-far');
+  C.writeLink(here, { workspace: far, session_id: 'X', name: 'old-plan' });
+  // Backdate past the one-hour window.
+  const p = C.linkPath(here);
+  const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+  raw.created_at = Date.now() - (2 * 60 * 60_000);
+  fs.writeFileSync(p, JSON.stringify(raw));
+  assert.equal(C.readLink(here), null, 'intent from two hours ago is not intent now');
+});
+
+test('no link means normal scope is untouched', () => {
+  const here = tmpWs('adv-none');
+  assert.equal(C.readLink(here), null);
+  assert.equal(C.readScope(here), 'normal', 'advanced must never be reachable by accident');
+});
+
+test('ending a session removes it from the cross-repo index', () => {
+  const R = require('../src/registry');
+  R.clear();
+  const { store, ws } = freshStore('reg-end');
+  C.registerSession(store, { session_id: 'x', cwd: ws, workspace: ws, agent: 'claude-code', agent_pid: process.pid });
+  assert.equal(R.openRepos().length, 1, 'registering publishes the repo');
+  store.endSession('x');
+  assert.equal(R.openRepos().length, 0, 'closing it withdraws the repo');
+  store.close();
+  R.clear();
+});
+
 test('the index shows LIVE only, and says how many ended are hidden', () => {
   const { store, ws } = freshStore('liveonly');
   store.upsertSession({ session_id: 'live', workspace: ws, agent_pid: process.pid, name: 'still-running', agent: 'claude-code' });
@@ -1455,9 +1568,16 @@ test('the index shows LIVE only, and says how many ended are hidden', () => {
   assert.ok(!dflt.body.includes('finished-work'), 'ended not listed');
   assert.ok(/1 ended hidden/.test(dflt.body), 'but never silently dropped');
 
+  // Normal scope cannot reach an ended session, so --all must not pretend it can.
   const all = C.sessionIndex(store, ws, null, { all: true });
-  assert.equal(all.sessions.length, 2, '--all brings ended back');
-  assert.ok(all.body.includes('finished-work'));
+  assert.equal(all.sessions.length, 1, '--all does NOT resurrect ended work in normal scope');
+  assert.ok(!all.body.includes('finished-work'));
+
+  C.writeScope(ws, 'advanced');
+  const adv = C.sessionIndex(store, ws, null, { all: true });
+  assert.equal(adv.sessions.length, 2, 'advanced scope is where --all widens');
+  assert.ok(adv.body.includes('finished-work'));
+  C.writeScope(ws, 'normal');
   store.close();
 });
 
@@ -1469,6 +1589,34 @@ test('when nothing is live it says so, and points at the ended ones', () => {
   assert.equal(idx.sessions.length, 0);
   assert.ok(/No sessions are live/.test(idx.body));
   assert.ok(/--all/.test(idx.body), 'tells you how to reach them');
+  store.close();
+});
+
+test('normal scope: an ended session is unreachable by @tag or by name', () => {
+  const { store, ws } = freshStore('scope-ended');
+  store.upsertSession({ session_id: 'gone', workspace: ws, agent_pid: process.pid, name: 'finished-work', agent: 'claude-code' });
+  store.endSession('gone');
+
+  assert.equal(C.resolveMentions(store, ws, 'what did @finished-work find?', 'ME').length, 0,
+    'naming an ended session must miss, not resurrect it');
+  assert.equal(C.findTarget(store, ws, 'finished-work', 'ME'), null,
+    'and attach must not find it either');
+
+  C.writeScope(ws, 'advanced');
+  assert.equal(C.resolveMentions(store, ws, 'what did @finished-work find?', 'ME').length, 1,
+    'advanced scope is the deliberate way in');
+  assert.ok(C.findTarget(store, ws, 'finished-work', 'ME'), 'and attach follows the same rule');
+  C.writeScope(ws, 'normal');
+  store.close();
+});
+
+test('scope defaults to normal, and only the exact string "advanced" opens it', () => {
+  const { store, ws } = freshStore('scope-default');
+  assert.equal(C.readScope(ws), 'normal', 'cross-repo must never be the default');
+  C.writeScope(ws, 'ADVANCED');
+  assert.equal(C.readScope(ws), 'normal', 'a near-miss value must not silently widen access');
+  C.writeScope(ws, 'advanced');
+  assert.equal(C.readScope(ws), 'advanced');
   store.close();
 });
 
@@ -1493,12 +1641,31 @@ test('sb_peers({all:true}) returns the same index over MCP', async () => {
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_peers', arguments: { all: true } } });
   await flush();
   const t = sent[1].result.content[0].text;
-  assert.ok(t.includes('refactor api'), 'ended session included');
-  assert.ok(t.includes('ENDED'));
+  assert.ok(!t.includes('refactor api'), 'normal scope must not hand an ended session to the model');
+  assert.ok(!t.includes('ENDED'));
   srv.shutdown();
 });
 
-test('sb_peers with no live peers still points at attachable ended ones', async () => {
+test('sb_peers({all:true}) DOES reach ended sessions once scope is advanced', async () => {
+  const ws = tmpWs('idx4b');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'refactor api' }, { agent: CC });
+  const store = new Store(W.storePath(ws));
+  store.endSession('A');
+  store.close();
+  C.writeScope(ws, 'advanced');
+
+  const sent = [];
+  const srv = new McpServer({ cwd: ws, stdout: { write: s => sent.push(JSON.parse(s)) } });
+  const send = o => srv.handleLine(JSON.stringify(o));
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'claude-code' } } });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_peers', arguments: { all: true } } });
+  await flush();
+  assert.ok(sent[1].result.content[0].text.includes('refactor api'), 'advanced scope opts in deliberately');
+  srv.shutdown();
+});
+
+test('sb_peers with no live peers does NOT surface ended work in normal scope', async () => {
   const ws = tmpWs('idx5');
   H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
   H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws, user_input: 'half-finished work' }, { agent: CC });
@@ -1513,7 +1680,8 @@ test('sb_peers with no live peers still points at attachable ended ones', async 
   send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_peers', arguments: {} } });
   await flush();
   const t = sent[1].result.content[0].text;
-  assert.ok(t.includes('half-finished work'), 'a dead-end answer would hide recoverable work');
+  assert.ok(!t.includes('half-finished work'),
+    'the past is not context in normal scope - switchboard-adv is the deliberate way in');
   srv.shutdown();
 });
 
