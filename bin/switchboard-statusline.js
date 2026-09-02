@@ -72,16 +72,30 @@ function switchboardTag(cwd) {
 // Walk up looking for a workspace switchboard is actually installed in.
 // Presence of .switchboard/ or a switchboard entry in .mcp.json is the signal;
 // we do not claim to be active in a repo where init was never run.
+//
+// Two boundaries, and both are load-bearing:
+//
+//   HOME — ~/.switchboard is the global cross-repo index that advanced mode
+//   creates. It is not a workspace install. Without this check, the moment a
+//   user runs switchboard-adv anywhere, every repo under their home directory
+//   would show the badge.
+//
+//   .git — the repo root. If we reach it without finding a marker, switchboard
+//   is not installed HERE, and whatever sits above the repo is irrelevant.
 function findWorkspace(cwd) {
+  const home = path.resolve(os.homedir());
   let dir = path.resolve(cwd || process.cwd());
   for (;;) {
-    if (fs.existsSync(path.join(dir, '.switchboard'))) return dir;
-    try {
-      const mcp = JSON.parse(fs.readFileSync(path.join(dir, '.mcp.json'), 'utf8'));
-      if (mcp?.mcpServers?.switchboard) return dir;
-    } catch { /* keep walking */ }
+    if (dir !== home) {
+      if (fs.existsSync(path.join(dir, '.switchboard'))) return dir;
+      try {
+        const mcp = JSON.parse(fs.readFileSync(path.join(dir, '.mcp.json'), 'utf8'));
+        if (mcp?.mcpServers?.switchboard) return dir;
+      } catch { /* keep walking */ }
+    }
+    if (fs.existsSync(path.join(dir, '.git'))) return null;   // repo root, no marker
     const up = path.dirname(dir);
-    if (up === dir) return null;
+    if (up === dir || dir === home) return null;
     dir = up;
   }
 }

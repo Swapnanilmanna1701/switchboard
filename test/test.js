@@ -2282,11 +2282,11 @@ group('status line indicator');
 const { execFileSync } = require('node:child_process');
 const SL_BIN = path.join(__dirname, '..', 'bin', 'switchboard-statusline.js');
 
-function renderStatusline(cwd, configDir, sessionId) {
+function renderStatusline(cwd, configDir, sessionId, extraEnv = {}) {
   return execFileSync(process.execPath, [SL_BIN], {
     input: JSON.stringify({ cwd, session_id: sessionId, workspace: { current_dir: cwd } }),
     encoding: 'utf8',
-    env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
+    env: { ...process.env, CLAUDE_CONFIG_DIR: configDir, ...extraEnv },
   });
 }
 
@@ -2299,6 +2299,25 @@ test('shows [SWITCHBOARD] only where switchboard is installed', () => {
 
   assert.ok(renderStatusline(on, cfg).includes('[SWITCHBOARD]'));
   assert.equal(renderStatusline(off, cfg).trim(), '', 'no false claim where it was never installed');
+
+  // The global cross-repo index lives at ~/.switchboard. It must NOT be
+  // mistaken for a workspace install, or running switchboard-adv once would
+  // badge every repo under the home directory. The walk stops at the repo
+  // root, so anything above it — including HOME — cannot make this claim.
+  fs.mkdirSync(path.join(FAKE_HOME, '.switchboard'), { recursive: true });
+  const asHome = { HOME: FAKE_HOME };
+
+  // Boundary 1: the repo root. Walk stops at .git, so HOME is never consulted.
+  const repo = path.join(FAKE_HOME, 'projects', 'virgin');
+  fs.mkdirSync(path.join(repo, '.git', 'info'), { recursive: true });
+  assert.equal(renderStatusline(repo, cfg, undefined, asHome).trim(), '',
+    'a global index above the repo must never badge a repo that never ran init');
+
+  // Boundary 2: HOME itself, for a directory that is not inside any repo.
+  const loose = path.join(FAKE_HOME, 'notes');
+  fs.mkdirSync(loose, { recursive: true });
+  assert.equal(renderStatusline(loose, cfg, undefined, asHome).trim(), '',
+    '~/.switchboard is the cross-repo index, not a workspace install');
 });
 
 test('detects installation via .mcp.json, not only the store dir', () => {
