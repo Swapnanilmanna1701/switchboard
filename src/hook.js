@@ -1,7 +1,7 @@
 'use strict';
-// T3 enhancement (§10.7): one hook implementation, four agent dialects.
+// T3 enhancement (§10.7): one hook implementation, three agent dialects.
 //
-// Claude Code, Cursor, Gemini CLI and OpenCode converged on near-identical
+// Claude Code, Cursor and Gemini CLI converged on near-identical
 // lifecycles, so the only per-agent code is a name map and an output shape.
 // Everything below the normaliser is shared.
 //
@@ -36,7 +36,9 @@ const DIALECTS = {
     read: r => ({
       session_id: r.session_id, cwd: r.cwd,
       tool_name: r.tool_name, tool_input: r.tool_input,
-      last_message: r.last_assistant_message, prompt: r.user_input,
+      // Current Claude Code sends `prompt`; keep `user_input` for older
+      // releases and existing test fixtures.
+      last_message: r.last_assistant_message, prompt: r.prompt || r.user_input,
       hook_event_name: r.hook_event_name,
     }),
     // Verified against code.claude.com/docs/en/hooks.
@@ -86,20 +88,6 @@ const DIALECTS = {
     alsoStdout: true,
   },
 
-  opencode: {
-    events: {
-      'session.start': EV.SESSION_START, 'tool.before': EV.PRE_TOOL, 'tool.after': EV.POST_TOOL,
-      'session.idle': EV.STOP, 'session.end': EV.SESSION_END, 'chat.message': EV.PROMPT,
-    },
-    read: r => ({
-      session_id: r.sessionID || r.session_id, cwd: r.directory || r.cwd,
-      tool_name: r.tool || r.tool_name, tool_input: r.args || r.tool_input,
-      last_message: r.message, prompt: r.prompt,
-      hook_event_name: r.event || r.type,
-    }),
-    emit: (_ev, ctxText) => ctxText ? { additionalContext: ctxText } : null,
-    alsoStdout: true,
-  },
 };
 
 // Tools whose use means "this session is editing this file".
@@ -161,6 +149,7 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
 
   let out = null;
   let notice = null;      // user-visible confirmation, shown by the agent
+  let sessionTitle = null; // Claude's native title, kept equal to our exact name
 
   try {
     switch (ev) {
@@ -212,13 +201,13 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
       case EV.PROMPT: {
         // FR-6.2: the first prompt is the session's intent.
         const me = store.getSession(sessionId);
-        if (r.prompt && !me?.intent) {
+        if (C.isMeaningfulTask(r.prompt) && (!me?.intent || !C.isMeaningfulTask(me.intent))) {
           C.registerSession(store, {
             session_id: sessionId, cwd, workspace: ws, agent, agent_pid: agentPid,
             intent: D.truncate(D.collapse(r.prompt), 200),
           });
           // Now that we know what this session is FOR, give it a real name.
-          C.nameFromWork(store, sessionId, ws, { intent: r.prompt });
+          sessionTitle = C.nameFromWork(store, sessionId, ws, { intent: r.prompt });
           C.writeRoster(store, ws);
         } else {
           store.touch(sessionId, 'active');
@@ -349,7 +338,7 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
     try { store.close(); } catch { /* ignore */ }
   }
 
-  return { output: out, dialect, event: ev, rawEvent, notice };
+  return { output: out, dialect, event: ev, rawEvent, notice, sessionTitle };
 }
 
 // Blue, to match the [SWITCHBOARD] badge in the status line.
@@ -387,11 +376,17 @@ function nameFor(agent, sessionId, ws, agentPid) {
 function run({ input, agent, event, stdout = process.stdout }) {
   let raw = {};
   try { raw = JSON.parse(input || '{}'); } catch { raw = {}; }
-  const { output, dialect, notice } = handle(raw, { agent, eventOverride: event });
-  if (!output && !notice) return 0;
+  const { output, dialect, notice, sessionTitle } = handle(raw, { agent, eventOverride: event });
+  if (!output && !notice && !sessionTitle) return 0;
 
   const evName = raw.hook_event_name || event || '';
-  const payload = output ? dialect.emit(evName, output) : {};
+  const payload = (output ? dialect.emit(evName, output) : {}) || {};
+  // UserPromptSubmit supports sessionTitle. This aligns Claude's own session
+  // picker/typeahead with Switchboard instead of leaving a logline2-ab alias.
+  if (sessionTitle && agent === 'claude-code' && evName === 'UserPromptSubmit') {
+    payload.hookSpecificOutput = payload.hookSpecificOutput || { hookEventName: evName };
+    payload.hookSpecificOutput.sessionTitle = sessionTitle;
+  }
   // `systemMessage` is shown to the USER, not the model — that is what makes a
   // resolved @tag visibly acknowledged rather than silently absorbed.
   if (notice) (payload || {}).systemMessage = notice;

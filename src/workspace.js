@@ -154,7 +154,7 @@ const AGENTS = {
   'claude-code': { label: 'Claude Code', hooks: true  },
   'cursor':      { label: 'Cursor',      hooks: true  },
   'gemini-cli':  { label: 'Gemini CLI',  hooks: true  },
-  'opencode':    { label: 'OpenCode',    hooks: true  },
+  'opencode':    { label: 'OpenCode',    hooks: false },
   'windsurf':    { label: 'Windsurf',    hooks: false },
   'codex':       { label: 'Codex CLI',   hooks: false },
   'copilot':     { label: 'Copilot',     hooks: false },

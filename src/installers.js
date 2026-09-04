@@ -12,25 +12,36 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const W = require('./workspace');
+const PACKAGE_NAME = require('../package.json').name;
 
 const HOME = os.homedir();
 const KEY = 'switchboard';
 const MARK_BEGIN = '<!-- switchboard:begin -->';
 const MARK_END = '<!-- switchboard:end -->';
 
-// How agents should launch us. `npx -y switchboard-mcp` works before a global
-// install exists, which is the whole point of an npx-first product.
+// How agents should launch us before a global install exists. Secondary bin
+// names are not package names, so explicitly tell npx which package provides
+// them. On Windows, MCP clients commonly spawn without a shell and therefore
+// need the actual npx.cmd shim name.
+function npxCommand(opts = {}) {
+  return (opts.platform || process.platform) === 'win32' ? 'npx.cmd' : 'npx';
+}
+
+function npxArgs(bin) {
+  return ['-y', '--package', PACKAGE_NAME, bin];
+}
+
 function serverSpec(opts = {}) {
   if (opts.local) {
     return { command: process.execPath, args: [path.join(__dirname, '..', 'bin', 'switchboard-mcp.js')] };
   }
-  return { command: 'npx', args: ['-y', 'switchboard-mcp'] };
+  return { command: npxCommand(opts), args: npxArgs('switchboard-mcp') };
 }
 
 function hookCommand(agent, event, opts = {}) {
   const bin = opts.local
     ? `${quote(process.execPath)} ${quote(path.join(__dirname, '..', 'bin', 'switchboard-hook.js'))}`
-    : 'npx -y switchboard-hook';
+    : `${npxCommand(opts)} ${npxArgs('switchboard-hook').join(' ')}`;
   return `${bin} --agent ${agent} --event ${event}`;
 }
 
@@ -47,6 +58,27 @@ function writeJson(p, obj) {
   fs.writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`);
 }
 
+function sameServerSpec(actual, opts) {
+  const expected = serverSpec(opts);
+  return actual?.command === expected.command &&
+    Array.isArray(actual?.args) &&
+    actual.args.length === expected.args.length &&
+    actual.args.every((arg, i) => arg === expected.args[i]);
+}
+
+function openCodeSpec(opts = {}) {
+  const spec = serverSpec(opts);
+  return { type: 'local', command: [spec.command, ...spec.args], enabled: true };
+}
+
+function sameOpenCodeSpec(actual, opts) {
+  const expected = openCodeSpec(opts);
+  return actual?.type === expected.type && actual?.enabled !== false &&
+    Array.isArray(actual?.command) &&
+    actual.command.length === expected.command.length &&
+    actual.command.every((arg, i) => arg === expected.command[i]);
+}
+
 // ---- MCP config writers ----------------------------------------------------
 
 // Shape A: { mcpServers: { switchboard: {command,args} } }
@@ -54,7 +86,7 @@ function writeJson(p, obj) {
 function mcpShapeA(file, opts) {
   return {
     detect: () => fs.existsSync(file) || fs.existsSync(path.dirname(file)),
-    installed: () => !!readJson(file)?.mcpServers?.[KEY],
+    installed: () => sameServerSpec(readJson(file)?.mcpServers?.[KEY], opts),
     apply: () => {
       const cur = readJson(file) || {};
       cur.mcpServers = cur.mcpServers || {};
@@ -77,7 +109,7 @@ function mcpShapeA(file, opts) {
 function mcpShapeB(file, opts) {
   return {
     detect: () => fs.existsSync(path.dirname(file)),
-    installed: () => !!readJson(file)?.servers?.[KEY],
+    installed: () => sameServerSpec(readJson(file)?.servers?.[KEY], opts),
     apply: () => {
       const cur = readJson(file) || {};
       cur.servers = cur.servers || {};
@@ -102,7 +134,7 @@ function mcpShapeC(file, opts) {
     // is what says "this agent is installed". Its settings file may not exist
     // yet on a fresh install.
     detect: () => fs.existsSync(file) || fs.existsSync(path.dirname(file)),
-    installed: () => !!readJson(file)?.context_servers?.[KEY],
+    installed: () => sameServerSpec(readJson(file)?.context_servers?.[KEY], opts),
     apply: () => {
       const cur = readJson(file) || {};
       cur.context_servers = cur.context_servers || {};
@@ -120,6 +152,48 @@ function mcpShapeC(file, opts) {
   };
 }
 
+// OpenCode: { mcp: { switchboard: { type: "local", command: [...] } } }.
+// Its command is one argv array, unlike the command/args split used by most
+// other clients. Older Switchboard versions incorrectly wrote
+// .opencode/mcp.json; migrate only our own entry and preserve everything else.
+function mcpOpenCode(file, legacyFile, opts) {
+  const removeLegacyEntry = () => {
+    const cur = readJson(legacyFile);
+    if (!cur?.mcpServers?.[KEY]) return;
+    delete cur.mcpServers[KEY];
+    if (Object.keys(cur.mcpServers).length === 0) delete cur.mcpServers;
+    if (Object.keys(cur).length === 0) fs.rmSync(legacyFile, { force: true });
+    else writeJson(legacyFile, cur);
+  };
+  return {
+    detect: () => fs.existsSync(file) || fs.existsSync(legacyFile) ||
+      fs.existsSync(path.join(path.dirname(file), '.opencode')),
+    installed: () => sameOpenCodeSpec(readJson(file)?.mcp?.[KEY], opts),
+    apply: () => {
+      const cur = readJson(file) || {};
+      cur.$schema = cur.$schema || 'https://opencode.ai/config.json';
+      cur.mcp = cur.mcp || {};
+      cur.mcp[KEY] = openCodeSpec(opts);
+      writeJson(file, cur);
+      removeLegacyEntry();
+      return file;
+    },
+    revert: () => {
+      let changed = false;
+      const cur = readJson(file);
+      if (cur?.mcp?.[KEY]) {
+        delete cur.mcp[KEY];
+        if (Object.keys(cur.mcp).length === 0) delete cur.mcp;
+        writeJson(file, cur);
+        changed = true;
+      }
+      const legacy = readJson(legacyFile);
+      if (legacy?.mcpServers?.[KEY]) { removeLegacyEntry(); changed = true; }
+      return changed ? file : null;
+    },
+  };
+}
+
 // Shape D: TOML — Codex CLI, the only non-JSON target.
 // ponytail: append/strip a whole named section rather than parsing TOML. A
 // real TOML parser is a dependency, and we only ever own one section. If Codex
@@ -131,40 +205,59 @@ function mcpShapeD(file, opts) {
     `\n${header}\n` +
     `command = ${JSON.stringify(spec.command)}\n` +
     `args = [${spec.args.map(a => JSON.stringify(a)).join(', ')}]\n`;
+  const commandLine = `command = ${JSON.stringify(spec.command)}`;
+  const argsLine = `args = [${spec.args.map(a => JSON.stringify(a)).join(', ')}]`;
   return {
     detect: () => fs.existsSync(file) || fs.existsSync(path.dirname(file)),
     installed: () => {
-      try { return fs.readFileSync(file, 'utf8').includes(header); } catch { return false; }
+      try {
+        const section = tomlSection(fs.readFileSync(file, 'utf8'), header);
+        return section.includes(commandLine) && section.includes(argsLine);
+      } catch { return false; }
     },
     apply: () => {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const cur = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
-      if (cur.includes(header)) return file;
-      fs.writeFileSync(file, cur + block);
+      const section = tomlSection(cur, header);
+      if (section.includes(commandLine) && section.includes(argsLine)) return null;
+      const base = stripTomlSection(cur, header).replace(/\n*$/, '');
+      fs.writeFileSync(file, base + block);
       return file;
     },
     revert: () => {
       if (!fs.existsSync(file)) return null;
       const cur = fs.readFileSync(file, 'utf8');
       if (!cur.includes(header)) return null;
-      // Line-based, not regex: a `[` also opens a TOML array, so "delete until
-      // the next [" chops mid-value and orphans lines. A section ends at the
-      // next line that is itself a section header.
-      const isHeader = l => /^\s*\[[^\]]+\]\s*$/.test(l);
-      const lines = cur.split('\n');
-      const out = [];
-      let skipping = false;
-      for (const l of lines) {
-        if (isHeader(l)) skipping = l.trim() === header;
-        if (!skipping) out.push(l);
-      }
-      const body = out.join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '');
+      const body = stripTomlSection(cur, header);
       // If we authored the whole file, leave nothing behind.
       if (body.trim() === '') { fs.rmSync(file, { force: true }); return file; }
       fs.writeFileSync(file, body);
       return file;
     },
   };
+}
+
+// Line-based, not regex: `[` can also open a TOML array, so a section boundary
+// is only a line that consists entirely of a TOML table header.
+function tomlSection(body, wanted) {
+  const lines = String(body).split('\n');
+  const out = [];
+  let inside = false;
+  for (const line of lines) {
+    if (/^\s*\[[^\]]+\]\s*$/.test(line)) inside = line.trim() === wanted;
+    if (inside) out.push(line);
+  }
+  return out.join('\n');
+}
+
+function stripTomlSection(body, wanted) {
+  const out = [];
+  let skipping = false;
+  for (const line of String(body).split('\n')) {
+    if (/^\s*\[[^\]]+\]\s*$/.test(line)) skipping = line.trim() === wanted;
+    if (!skipping) out.push(line);
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '');
 }
 
 // ---- hook config writers ---------------------------------------------------
@@ -186,7 +279,8 @@ function claudeHooks(file, opts) {
     detect: () => fs.existsSync(path.dirname(file)),
     installed: () => {
       const cur = readJson(file);
-      return !!cur?.hooks?.SessionStart?.some(g => (g.hooks || []).some(isOurs));
+      return CLAUDE_HOOKS.every(([event]) => cur?.hooks?.[event]?.some(g =>
+        (g.hooks || []).some(h => h.command === hookCommand('claude-code', event, opts))));
     },
     apply: () => {
       const cur = readJson(file) || {};
@@ -229,7 +323,8 @@ function cursorHooks(file, opts) {
     detect: () => fs.existsSync(path.dirname(file)),
     installed: () => {
       const cur = readJson(file);
-      return !!cur?.hooks?.sessionStart?.some(isOurs);
+      return CURSOR_HOOKS.every(event => cur?.hooks?.[event]?.some(h =>
+        h.command === hookCommand('cursor', event, opts)));
     },
     apply: () => {
       const cur = readJson(file) || { version: 1 };
@@ -264,7 +359,8 @@ function geminiHooks(file, opts) {
     detect: () => fs.existsSync(path.dirname(file)),
     installed: () => {
       const cur = readJson(file);
-      return !!cur?.hooks?.SessionStart?.some(g => (g.hooks || []).some(isOurs));
+      return GEMINI_HOOKS.every(event => cur?.hooks?.[event]?.some(g =>
+        (g.hooks || []).some(h => h.command === hookCommand('gemini-cli', event, opts))));
     },
     apply: () => {
       const cur = readJson(file) || {};
@@ -311,7 +407,7 @@ function agentPresent(agent, workspace, home = HOME) {
     case 'claude-code': return h('.claude') || w('.claude') || w('CLAUDE.md') || w('.mcp.json');
     case 'cursor':      return h('.cursor') || w('.cursor');
     case 'gemini-cli':  return h('.gemini') || w('.gemini');
-    case 'opencode':    return h('.config/opencode') || h('.opencode') || w('.opencode');
+    case 'opencode':    return h('.config/opencode') || h('.opencode') || w('.opencode') || w('opencode.json');
     case 'copilot':     return w('.vscode') || h('.vscode');
     case 'cline':       return w('.cline') || h('.cline');
     case 'codex':       return h('.codex');
@@ -344,7 +440,8 @@ function targets(workspace, opts = {}) {
     T('gemini-cli',  'Gemini CLI',  'hook', 3, 'workspace', w('.gemini/settings.json'), geminiHooks(w('.gemini/settings.json'), opts)),
     T('copilot',     'VS Code / Copilot', 'mcp', 1, 'workspace', w('.vscode/mcp.json'), mcpShapeB(w('.vscode/mcp.json'), opts)),
     T('cline',       'Cline',       'mcp',  1, 'workspace', w('.cline/mcp.json'),       mcpShapeA(w('.cline/mcp.json'), opts)),
-    T('opencode',    'OpenCode',    'mcp',  1, 'workspace', w('.opencode/mcp.json'),    mcpShapeA(w('.opencode/mcp.json'), opts)),
+    T('opencode',    'OpenCode',    'mcp',  1, 'workspace', w('opencode.json'),
+      mcpOpenCode(w('opencode.json'), w('.opencode/mcp.json'), opts)),
     T('codex',       'Codex CLI',   'mcp',  1, 'user', h('.codex/config.toml'),                mcpShapeD(h('.codex/config.toml'), opts)),
     T('windsurf',    'Windsurf',    'mcp',  1, 'user', h('.codeium/windsurf/mcp_config.json'), mcpShapeA(h('.codeium/windsurf/mcp_config.json'), opts)),
     T('zed',         'Zed',         'mcp',  1, 'user', h('.config/zed/settings.json'),         mcpShapeC(h('.config/zed/settings.json'), opts)),
@@ -356,14 +453,21 @@ function targets(workspace, opts = {}) {
 const STANZA_BODY = `## Concurrent sessions
 
 Other AI sessions may be working in this repo right now.
-Before starting a task, call \`sb_peers\` (MCP) — or read
+Before starting a task, call \`sb_inbox\` and \`sb_peers\` (MCP) — or read
 \`.switchboard/ROSTER.md\` — to see what they're doing and which
 files they've claimed. Post findings with \`sb_note\`.
 
-Every session has a name describing what it is doing, e.g. \`fix-auth-tokens\`.
+After the first substantive user request, call \`sb_name\` with a short
+action-and-subject summary of the actual task. Do not use slash-command output
+or Switchboard status text as the task. Hook-capable agents may already have a
+proper name; in that case \`sb_name\` simply returns it.
+
+Every session entry labels its \`Exact session name\`, e.g. \`fix-auth-tokens\`.
 
 - If the user writes \`@<session-name>\`, they are referring to that session:
-  call \`sb_session\` with that name and use what it returns.
+  copy the exact name after \`@\` character-for-character, call \`sb_session\`
+  with that exact name, and use what it returns. Never shorten, rewrite, or
+  substitute the session description for the name.
 - To continue another session's work, call \`sb_attach\` with its name.`;
 
 const STANZA = `${MARK_BEGIN}\n${STANZA_BODY}\n${MARK_END}\n`;
@@ -458,6 +562,86 @@ function claudeBridge(workspace) {
 
 function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+// ---- the $sbs Codex skill -------------------------------------------------
+
+// Codex's native reusable-workflow convention is a repository skill invoked
+// as `$sbs`. MCP remains the execution layer; this file only teaches Codex how
+// to route the user's compact command to the right Switchboard tool.
+const CODEX_SKILL_MARK = '<!-- switchboard:managed-codex-skill -->';
+const CODEX_SKILL_BODY = `---
+name: sbs
+description: Browse, reference, continue, or message Switchboard sessions in the current repository. Use when the user invokes $sbs, asks to select or continue another AI session, or references an exact Switchboard session name.
+---
+
+${CODEX_SKILL_MARK}
+
+# Switchboard sessions
+
+Use the tools from the \`switchboard\` MCP server. Never invent, shorten, or
+rewrite a session name. Copy the value labelled \`Exact session name\`
+character-for-character.
+
+Route the request as follows:
+
+- Bare \`$sbs\`, browse, pick, or switch: call \`sb_pick\` with \`all: true\`.
+  If it returns a selected session, use that context and continue its work. If
+  the client cannot show the picker and the tool returns an index, show that
+  index and wait for the user to choose; never choose for them.
+- List live sessions: call \`sb_peers\`. List live and ended sessions: call
+  \`sb_peers\` with \`all: true\`.
+- Reference, inspect, compare with, or an \`@<session-name>\` mention: call
+  \`sb_session\` with the exact name and use the returned context without
+  changing the current session's identity.
+- Continue or take over a named session: call \`sb_attach\` with the exact
+  name. Set \`adopt: true\` only when the user explicitly asks to adopt claims;
+  live-session claims must not be adopted.
+- Message a session: call \`sb_message\` with the exact target and the user's
+  text. Read messages with \`sb_inbox\`.
+
+Do not pass \`$sbs\`, picker output, or Switchboard status text to \`sb_name\`.
+For an ordinary substantive task, name the current session from the actual
+task with \`sb_name\` if it does not already have a stable name.
+
+If the Switchboard MCP server or required tools are unavailable, tell the user
+to inspect \`/mcp\` and restart Codex after running Switchboard initialization.
+`;
+
+function codexSkill(workspace) {
+  const dir = path.join(workspace, '.agents', 'skills', 'sbs');
+  const file = path.join(dir, 'SKILL.md');
+  const owned = body => String(body || '').includes(CODEX_SKILL_MARK);
+
+  return {
+    file,
+    installed: () => {
+      try { return fs.readFileSync(file, 'utf8') === CODEX_SKILL_BODY; } catch { return false; }
+    },
+    apply: () => {
+      let cur = null;
+      try { cur = fs.readFileSync(file, 'utf8'); } catch { /* new skill */ }
+      if (cur === CODEX_SKILL_BODY) return null;
+      if (cur !== null && !owned(cur)) {
+        throw new Error(`refusing to overwrite existing user skill: ${file}`);
+      }
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(file, CODEX_SKILL_BODY);
+      return file;
+    },
+    revert: () => {
+      if (!fs.existsSync(file)) return null;
+      const cur = fs.readFileSync(file, 'utf8');
+      if (!owned(cur)) return null;
+      fs.rmSync(file, { force: true });
+      try { if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir); } catch { /* keep */ }
+      const skillsDir = path.dirname(dir);
+      try { if (fs.readdirSync(skillsDir).length === 0) fs.rmdirSync(skillsDir); } catch { /* keep */ }
+      const agentsDir = path.dirname(skillsDir);
+      try { if (fs.readdirSync(agentsDir).length === 0) fs.rmdirSync(agentsDir); } catch { /* keep */ }
+      return file;
+    },
+  };
+}
+
 // ---- the /sbs slash command ------------------------------------------------
 
 // Claude Code and Cursor both read project slash commands from a directory of
@@ -475,8 +659,10 @@ ended — that I select from directly with the arrow keys. Do NOT print the list
 yourself and do NOT ask me which one in text: the tool does the asking.
 
 Whatever it returns is the chosen session's full context. Tell me in two or
-three lines what that session was doing and where it left off, then continue
-its work from there.
+three lines what that session was doing and where it left off. Start with
+\`Exact session name: <name>\` and \`Reference exactly as: @<name>\`, using the
+complete name returned by the tool without shortening or rewriting it. Then
+continue its work from there.
 
 If it reports that no session was selected, stop and say so — do not pick one
 for me.
@@ -547,7 +733,7 @@ function statusLine(opts = {}) {
   const chainFile = path.join(dir, 'switchboard-statusline.json');
   const script = path.join(__dirname, '..', 'bin', 'switchboard-statusline.js');
   const ours = opts.local === false
-    ? 'npx -y switchboard-statusline'
+    ? `${npxCommand(opts)} ${npxArgs('switchboard-statusline').join(' ')}`
     : `${quote(process.execPath)} ${quote(script)}`;
 
   const isOurs = c => typeof c === 'string' && c.includes('switchboard-statusline');
@@ -555,14 +741,19 @@ function statusLine(opts = {}) {
   return {
     file: settings,
     command: ours,
-    installed: () => isOurs(readJson(settings)?.statusLine?.command),
+    installed: () => readJson(settings)?.statusLine?.command === ours,
     current: () => readJson(settings)?.statusLine?.command || null,
     chained: () => readJson(chainFile)?.chain || null,
 
     apply: () => {
       const cur = readJson(settings) || {};
       const existing = cur.statusLine?.command;
-      if (isOurs(existing)) return null;                       // idempotent
+      if (existing === ours) return null;                      // idempotent
+      if (isOurs(existing)) {                                  // migrate our old launcher
+        cur.statusLine = { type: 'command', command: ours };
+        writeJson(settings, cur);
+        return settings;
+      }
       fs.mkdirSync(dir, { recursive: true });
       // Preserve whatever was there so our script can run it first.
       fs.writeFileSync(chainFile, `${JSON.stringify({
@@ -614,6 +805,14 @@ function plan(workspace, opts = {}) {
     file: sc.file, detected: true, installed: sc.installed(),
     action: sc.installed() ? 'ok' : 'write', w: sc });
 
+  const cs = codexSkill(workspace);
+  const codexDetected = agentPresent('codex', workspace, opts.home || HOME);
+  if (codexDetected || opts.all || cs.installed()) {
+    items.push({ agent: 'codex', label: '$sbs Codex skill', kind: 'skill', tier: 1,
+      file: cs.file, detected: codexDetected, installed: cs.installed(),
+      action: cs.installed() ? 'ok' : 'write', w: cs });
+  }
+
   const c = claudeBridge(workspace);
   items.push({ agent: 'claude-code', label: 'CLAUDE.md @AGENTS.md bridge', kind: 'context', tier: 0, file: c.file,
     detected: true, installed: c.installed(), action: c.installed() ? 'ok' : 'write', w: c });
@@ -655,6 +854,7 @@ function revert(workspace, opts = {}) {
     { agent: 'all', label: 'AGENTS.md stanza', kind: 'context', w: agentsMd(workspace), file: path.join(workspace, 'AGENTS.md') },
     { agent: 'claude-code', label: 'CLAUDE.md bridge', kind: 'context', w: claudeBridge(workspace), file: path.join(workspace, 'CLAUDE.md') },
     { agent: 'all', label: '/sbs slash commands', kind: 'context', w: slashCommands(workspace, { ...opts, all: true }), file: path.join(workspace, '.claude/commands') },
+    { agent: 'codex', label: '$sbs Codex skill', kind: 'skill', w: codexSkill(workspace), file: path.join(workspace, '.agents/skills/sbs/SKILL.md') },
   ];
   for (const t of all) {
     try { const f = t.w.revert(); if (f) removed.push({ ...t, removed: f }); }
@@ -665,7 +865,9 @@ function revert(workspace, opts = {}) {
 }
 
 module.exports = {
-  targets, plan, apply, revert, agentsMd, claudeBridge, agentPresent, statusLine, slashCommands,
+  targets, plan, apply, revert, agentsMd, claudeBridge, agentPresent, statusLine, slashCommands, codexSkill,
   serverSpec, hookCommand, STANZA, STANZA_BODY, MARK_BEGIN, MARK_END,
+  CODEX_SKILL_BODY, CODEX_SKILL_MARK,
+  npxCommand, npxArgs, PACKAGE_NAME,
   CLAUDE_HOOKS, CURSOR_HOOKS, GEMINI_HOOKS,
 };

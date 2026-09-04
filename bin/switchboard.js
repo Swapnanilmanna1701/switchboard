@@ -12,7 +12,14 @@ const { Store } = require('../src/store');
 const pkg = require('../package.json');
 
 const argv = process.argv.slice(2);
-const cmd = (argv[0] || 'help').replace(/^--?/, '');
+const COMMANDS = new Set([
+  'init', 'status', 'board', 'doctor', 'uninstall', 'purge', 'attach',
+  'sessions', 'ls', 'sbs', 'pick', 'mode', 'statusline', 'version', 'v', 'help',
+]);
+const commandArg = argv.find(arg => COMMANDS.has(arg.replace(/^--?/, '')));
+// The package's shortest path is its most important one: running it with no
+// command (or setup flags only) initializes the current repository.
+const cmd = (commandArg || 'init').replace(/^--?/, '');
 const flags = new Set(argv.filter(a => a.startsWith('--')));
 const has = f => flags.has(`--${f}`);
 
@@ -98,6 +105,11 @@ function status() {
       claims:   store._all('SELECT * FROM claims'),
       digests:  store._all('SELECT * FROM digests'),
       notes:    store._all('SELECT * FROM notes'),
+      messages: store._all('SELECT * FROM messages'),
+      message_reads: store._all('SELECT * FROM message_reads'),
+      tasks:     store._all('SELECT * FROM tasks'),
+      attachments: store._all('SELECT * FROM attachments'),
+      refs:      store._all('SELECT * FROM refs'),
       events:   store._all('SELECT * FROM events ORDER BY ts DESC LIMIT 200'),
     };
     console.log(JSON.stringify(dump, null, 2));
@@ -115,8 +127,12 @@ function status() {
       const claims = ctx.claimsBySession[p.session_id] || [];
       const d = ctx.digestBySession[p.session_id];
       const tier = p.tier >= 3 ? c.g('T3') : c.y('T1');
-      const alias = p.alias && p.alias !== p.name ? c.dim(` aka ${p.alias}`) : '';
-      console.log(`${c.b('•')} ${c.b(p.name || p.session_id.slice(0, 8))}${alias}  ${c.c(`[${W.agentLabel(p.agent)}]`)}  ${tier}  ${c.dim(`${p.status} ${D.ago(Date.now() - p.last_seen)}`)}`);
+      const name = p.name || p.session_id.slice(0, 8);
+      const alias = p.alias && p.alias !== name ? c.dim(` (native alias: ${p.alias})`) : '';
+      console.log(`${c.b('• SESSION')}`);
+      console.log(`  ${c.b('Exact session name:')} ${c.b(name)}${alias}`);
+      console.log(`  ${c.b('Reference exactly as:')} ${c.b(`@${name}`)}`);
+      console.log(`  ${c.c(`[${W.agentLabel(p.agent)}]`)}  ${tier}  ${c.dim(`${p.status} ${D.ago(Date.now() - p.last_seen)}`)}`);
       const desc = D.describe(p, d);
       if (desc) console.log(`  ${D.truncate(D.collapse(desc), 90)}`);
       if (claims.length) {
@@ -190,16 +206,18 @@ function doctor() {
   }
 
   console.log(`\n${c.b('Agent configuration')}`);
-  const items = I.plan(workspace, { all: true });
+  // A repository can legitimately point either at the published npm package
+  // or at this checkout (`init --local`). Doctor must recognize both.
+  const publishedTargets = I.targets(workspace, { all: true });
+  const localTargets = I.targets(workspace, { all: true, local: true });
   const byAgent = new Map();
-  for (const i of items) {
-    // Context rows (AGENTS.md, the CLAUDE.md bridge) are reported separately
-    // below; folding them in here overwrote the agent's real label and tier.
-    if (i.agent === 'all' || i.kind === 'context') continue;
+  for (let index = 0; index < publishedTargets.length; index++) {
+    const i = publishedTargets[index];
+    const installed = i.w.installed() || localTargets[index].w.installed();
     const e = byAgent.get(i.agent) || { label: i.label, mcp: false, hook: false, detected: false };
-    if (i.kind === 'mcp' && i.installed) e.mcp = true;
-    if (i.kind === 'hook' && i.installed) e.hook = true;
-    if (i.detected) e.detected = true;
+    if (i.kind === 'mcp' && installed) e.mcp = true;
+    if (i.kind === 'hook' && installed) e.hook = true;
+    if (i.w.detect()) e.detected = true;
     byAgent.set(i.agent, e);
   }
   for (const [agent, e] of byAgent) {
@@ -217,14 +235,17 @@ function doctor() {
   const a = I.agentsMd(workspace);
   console.log(`\n${c.b('Cross-agent context')}`);
   line('AGENTS.md stanza', a.installed(), rel(a.file));
+  const codexSkill = I.codexSkill(workspace);
+  line('$sbs Codex skill', codexSkill.installed(), rel(codexSkill.file));
   line('CLAUDE.md bridge', I.claudeBridge(workspace).installed(), rel(path.join(workspace, 'CLAUDE.md')));
   line('ROSTER.md present', fs.existsSync(W.rosterPath(workspace)), rel(W.rosterPath(workspace)));
 
   // §11.8 — sandboxing is detected and reported, never failed silently.
   console.log(`\n${c.b('Environment')}`);
   line('git repo', !!W.gitRoot(workspace));
-  line('cross-session messaging socket', !!process.env.CLAUDE_CODE_MESSAGING_SOCKET,
-    process.env.CLAUDE_CODE_MESSAGING_SOCKET ? 'sb_handoff can deliver natively' : 'sb_handoff returns text to relay');
+  line('database messaging', true, 'sb_message, sb_broadcast, sb_inbox');
+  line('native messaging socket', !!process.env.CLAUDE_CODE_MESSAGING_SOCKET,
+    process.env.CLAUDE_CODE_MESSAGING_SOCKET ? 'sb_handoff can deliver natively' : 'optional; sb_message still works');
 
   store.close();
   console.log(problems ? `\n${c.r(`${problems} problem(s) found.`)}` : `\n${c.g('✓ all good')}`);
@@ -312,8 +333,10 @@ function sbs() {
       workspace, target_id: chosen.session_id, target_name: nm,
       ttlMs: 15 * 60_000, adopt: has('adopt') && !chosen.live ? 1 : 0,
     });
-    console.log(`${c.g('✓')} selected ${c.b(handle)}${handle === nm ? '' : c.dim(` (${nm})`)}` +
+    console.log(`${c.g('✓')} selected session` +
       `  ${c.dim(chosen.live ? 'live' : 'ended')}`);
+    console.log(`  ${c.b('Exact session name:')} ${c.b(handle)}`);
+    console.log(`  ${c.b('Reference exactly as:')} ${c.b(`@${handle}`)}`);
     console.log(c.dim(`  its full context will load into the next session started here`));
     store.close();
 
@@ -474,20 +497,21 @@ function help() {
 ${c.b('switchboard')} ${c.dim(`v${pkg.version}`)} — ambient shared working memory for concurrent AI coding sessions
 
 ${c.b('Usage')}
-  npx switchboard init [--dry-run] [--all] [--local]
-  npx switchboard status [--json] [--raw]
-  npx switchboard sbs [name] [--run] [--all]  # picker, or select by name
-  npx switchboard sessions [--all]            # live sessions in THIS repo
-  npx switchboard attach [name] [--list] [--adopt] [--cancel]
-  npx switchboard board
-  npx switchboard doctor
-  npx switchboard statusline install|uninstall|status
-  npx switchboard uninstall [--purge]
-  npx switchboard purge
+  npx ${pkg.name}                              # initialize this repository
+  npx ${pkg.name} init [--dry-run] [--all] [--local]
+  npx ${pkg.name} status [--json] [--raw]
+  npx ${pkg.name} sbs [name] [--run] [--all]  # picker, or select by name
+  npx ${pkg.name} sessions [--all]            # live sessions in THIS repo
+  npx ${pkg.name} attach [name] [--list] [--adopt] [--cancel]
+  npx ${pkg.name} board
+  npx ${pkg.name} doctor
+  npx ${pkg.name} statusline install|uninstall|status
+  npx ${pkg.name} uninstall [--purge]
+  npx ${pkg.name} purge
 
 ${c.b('Cross-repo (advanced)')}
-  npx switchboard-adv                         # pick a session in ANOTHER repo
-  npx switchboard-adv --list|--status|--clear
+  npx --package ${pkg.name} switchboard-adv   # pick a session in ANOTHER repo
+  npx --package ${pkg.name} switchboard-adv --list|--status|--clear
 
   Normal scope is live sessions, this repo only — ended sessions are not
   reachable. Run switchboard-adv in a terminal BEFORE starting your agent to

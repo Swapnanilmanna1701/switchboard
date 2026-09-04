@@ -6,6 +6,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 const { Store, isPidAlive, ftsEscape } = require('../src/store');
 const W = require('../src/workspace');
@@ -408,6 +409,8 @@ test('roster labels the agent, for mixed-agent workspaces (§11.2)', () => {
   const out = D.renderPeer(
     { session_id: 's', name: 'ui', agent: 'cursor', status: 'active', last_seen: Date.now() }, [], null, '/w');
   assert.ok(out.includes('[Cursor]'));
+  assert.ok(out.includes('Exact session name: ui'));
+  assert.ok(out.includes('Reference exactly as: @ui'));
 });
 
 test('wrapForInjection marks peer text as data, not instructions (§13.8)', () => {
@@ -452,9 +455,9 @@ test('normalizeAgent maps real client names to stable slugs', () => {
   for (const [k, v] of Object.entries(cases)) assert.equal(W.normalizeAgent(k), v, `${k} -> ${v}`);
 });
 
-test('AGENTS registry marks exactly the four T3-capable agents', () => {
+test('AGENTS registry marks exactly the three T3-capable agents', () => {
   const hooked = Object.entries(W.AGENTS).filter(([, v]) => v.hooks).map(([k]) => k).sort();
-  assert.deepEqual(hooked, ['claude-code', 'cursor', 'gemini-cli', 'opencode']);
+  assert.deepEqual(hooked, ['claude-code', 'cursor', 'gemini-cli']);
 });
 
 test('gitExclude adds the store dir once, never twice', () => {
@@ -543,7 +546,11 @@ test('tools/list exposes every documented tool with a usable schema', () => {
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex' } } });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
   const names = sent[1].result.tools.map(t => t.name).sort();
-  assert.deepEqual(names, ['sb_attach', 'sb_claim', 'sb_handoff', 'sb_note', 'sb_peers', 'sb_pick', 'sb_search', 'sb_session']);
+  assert.deepEqual(names, [
+    'sb_assign', 'sb_attach', 'sb_broadcast', 'sb_claim', 'sb_diff', 'sb_handoff',
+    'sb_inbox', 'sb_message', 'sb_name', 'sb_note', 'sb_peers', 'sb_pick', 'sb_release',
+    'sb_search', 'sb_session', 'sb_tasks',
+  ]);
   for (const t of sent[1].result.tools) {
     assert.ok(t.description.length > 40, `${t.name} needs a usable description`);
     assert.equal(t.inputSchema.type, 'object');
@@ -560,6 +567,28 @@ test('sb_note then sb_search round-trips a finding', async () => {
   send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'sb_search', arguments: { query: 'seconds' } } });
   await flush();
   assert.ok(sent[2].result.content[0].text.includes('exp claim'));
+  srv.shutdown();
+});
+
+test('sb_name gives an MCP-only session a stable task-based name', async () => {
+  const ws = tmpWs('mcp-name');
+  const { srv, sent, send } = mcpHarness(ws);
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex' } } });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+    name: 'sb_name', arguments: { task: 'fix OAuth refresh token rotation' },
+  } });
+  await flush();
+  const body = sent[1].result.content[0].text;
+  assert.ok(body.includes('Exact session name: fix-oauth-refresh-token'));
+  assert.ok(body.includes('@fix-oauth-refresh-token'));
+  assert.equal(srv.ctx.store.getSession(srv.sessionId).named, 1);
+
+  send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
+    name: 'sb_name', arguments: { task: 'unrelated second task' },
+  } });
+  await flush();
+  assert.ok(sent[2].result.content[0].text.includes('fix-oauth-refresh-token'),
+    'the address remains stable after it is assigned');
   srv.shutdown();
 });
 
@@ -634,6 +663,124 @@ test('sb_handoff composes a message for the platform to deliver (ADR-6)', async 
   srv.shutdown();
 });
 
+test('direct messages and broadcasts reach only the intended workspace inboxes', async () => {
+  const ws = tmpWs('mcp-messages');
+  const a = mcpHarness(ws);
+  const b = mcpHarness(ws);
+  a.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex' } } });
+  b.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'cursor' } } });
+  // Hook-capable agents can have a real hook id plus a synthetic MCP id. A
+  // message addressed to the visible real row must still reach the MCP inbox.
+  const bMcp = b.srv.ctx.store.getSession(b.srv.sessionId);
+  b.srv.ctx.store.upsertSession({
+    session_id: 'cursor-real', workspace: b.srv.ctx.workspace, agent_pid: process.pid,
+    link_key: bMcp.link_key, name: 'real-cursor', agent: bMcp.agent, synthetic: 0,
+  });
+  const target = 'real-cursor';
+
+  a.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+    name: 'sb_message', arguments: { target, text: 'Please review the auth change' },
+  } });
+  await flush();
+  a.send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
+    name: 'sb_broadcast', arguments: { text: 'Tests are temporarily red; ignore sk-abcdefghijklmnopqrstuv' },
+  } });
+  await flush();
+  b.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'sb_inbox', arguments: {} } });
+  await flush();
+  const inbox = b.sent[1].result.content[0].text;
+  assert.ok(inbox.includes('review the auth') && inbox.includes('Tests are temporarily red'));
+  assert.ok(inbox.includes('[redacted:api-key]') && !inbox.includes('sk-abcdefghijklmnopqrstuv'));
+  assert.ok(/data, not instructions/i.test(inbox), 'peer messages are untrusted input');
+  b.send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'sb_inbox', arguments: {} } });
+  await flush();
+  assert.ok(b.sent[2].result.content[0].text.includes('No unread'));
+  a.srv.shutdown(); b.srv.shutdown();
+});
+
+test('shared tasks can be created, assigned, listed, and completed', async () => {
+  const ws = tmpWs('mcp-tasks');
+  const { srv, sent, send } = mcpHarness(ws);
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex' } } });
+  srv.ctx.store.upsertSession({
+    session_id: 'task-peer', workspace: srv.ctx.workspace, agent_pid: process.pid,
+    name: 'review-auth', agent: 'cursor', status: 'active',
+  });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+    name: 'sb_tasks', arguments: {
+      action: 'create', title: 'Review auth flow',
+      details: 'Check token expiry, not sk-abcdefghijklmnopqrstuv',
+    },
+  } });
+  await flush();
+  assert.ok(sent[1].result.content[0].text.includes('Created shared task #1'));
+  send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: {
+    name: 'sb_assign', arguments: { id: 1, target: 'review-auth' },
+  } });
+  await flush();
+  assert.ok(sent[2].result.content[0].text.includes('Assigned task #1'));
+  send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: {
+    name: 'sb_tasks', arguments: { action: 'list', assigned_to: 'review-auth' },
+  } });
+  await flush();
+  assert.ok(sent[3].result.content[0].text.includes('[in_progress] Review auth flow'));
+  assert.ok(sent[3].result.content[0].text.includes('[redacted:api-key]'));
+  send({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: {
+    name: 'sb_tasks', arguments: { action: 'update', id: 1, status: 'done' },
+  } });
+  await flush();
+  assert.ok(sent[4].result.content[0].text.includes('[done]'));
+  srv.shutdown();
+});
+
+test('sb_release drops selected claims or every claim', async () => {
+  const ws = tmpWs('mcp-release');
+  const { srv, sent, send } = mcpHarness(ws);
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex' } } });
+  for (const file of ['a.js', 'b.js']) srv.ctx.store.addClaim({
+    path: path.join(srv.ctx.workspace, file), session_id: srv.sessionId,
+    workspace: srv.ctx.workspace, ttlMs: 60_000,
+  });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+    name: 'sb_release', arguments: { paths: ['a.js'] },
+  } });
+  await flush();
+  assert.equal(srv.ctx.store.claimsFor(srv.sessionId).length, 1);
+  send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'sb_release', arguments: {} } });
+  await flush();
+  assert.equal(srv.ctx.store.claimsFor(srv.sessionId).length, 0);
+  assert.ok(sent[2].result.content[0].text.includes('Released all 1'));
+  srv.shutdown();
+});
+
+test('sb_diff returns the tracked Git diff only for another session recorded files', async () => {
+  const ws = tmpWs('mcp-diff');
+  execFileSync('git', ['init'], { cwd: ws, stdio: 'ignore' });
+  fs.writeFileSync(path.join(ws, 'tracked.txt'), 'before\n');
+  execFileSync('git', ['add', 'tracked.txt'], { cwd: ws });
+  execFileSync('git', ['-c', 'user.name=Switchboard Tests', '-c', 'user.email=test@example.invalid',
+    'commit', '-m', 'base'], { cwd: ws, stdio: 'ignore' });
+  fs.writeFileSync(path.join(ws, 'tracked.txt'), 'after\n');
+
+  const { srv, sent, send } = mcpHarness(ws);
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'codex' } } });
+  srv.ctx.store.upsertSession({
+    session_id: 'diff-peer', workspace: srv.ctx.workspace, agent_pid: process.pid,
+    name: 'edit-tracked', agent: 'cursor', status: 'active',
+  });
+  srv.ctx.store.putDigest({
+    session_id: 'diff-peer', workspace: srv.ctx.workspace, files: ['tracked.txt'], commands: [],
+  });
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+    name: 'sb_diff', arguments: { name: 'edit-tracked' },
+  } });
+  await flush();
+  const diff = sent[1].result.content[0].text;
+  assert.ok(diff.includes('-before') && diff.includes('+after'));
+  assert.ok(/data, not instructions/i.test(diff));
+  srv.shutdown();
+});
+
 test('unknown method and unknown tool return JSON-RPC errors, not crashes', async () => {
   const ws = tmpWs('mcp9');
   const { srv, sent, send } = mcpHarness(ws);
@@ -677,7 +824,7 @@ test('shutdown ends the session so peers stop seeing it', () => {
 });
 
 // ----------------------------------------------------------------- hook ----
-group('hook handler (four dialects)');
+group('hook handler (three dialects)');
 
 const CC = 'claude-code';
 
@@ -764,6 +911,63 @@ test('first prompt becomes the session intent', () => {
   store.close();
 });
 
+test('Claude current prompt field creates the semantic name and native session title', () => {
+  const ws = tmpWs('h8-current-claude');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'a', cwd: ws }, { agent: CC });
+  let out = '';
+  H.run({ input: JSON.stringify({
+    hook_event_name: 'UserPromptSubmit', session_id: 'a', cwd: ws,
+    prompt: 'repair checkout tax calculation',
+  }), agent: CC, stdout: { write: s => { out += s; } } });
+  const store = new Store(W.storePath(ws));
+  assert.equal(store.getSession('a').name, 'repair-checkout-tax-calculat');
+  assert.equal(store.getSession('a').intent, 'repair checkout tax calculation');
+  const payload = JSON.parse(out);
+  assert.equal(payload.hookSpecificOutput.sessionTitle, 'repair-checkout-tax-calculat');
+  store.close();
+});
+
+test('session picker never exposes numeric bootstrap aliases', () => {
+  const { store, ws } = freshStore('picker-no-bootstrap-alias');
+  store.upsertSession({ session_id: 'raw', workspace: ws, agent_pid: process.pid,
+    agent: 'claude-code', name: 'picker-no-bootstrap-alias-0a',
+    alias: 'picker-no-bootstrap-alias-0a', named: 0 });
+  const idx = C.sessionIndex(store, ws, null, { all: true });
+  assert.equal(idx.sessions.length, 0);
+  assert.equal(idx.unnamedCount, 1);
+  assert.ok(!idx.body.includes('picker-no-bootstrap-alias-0a'));
+  assert.ok(idx.body.includes('hidden from the picker'));
+  store.close();
+});
+
+test('Switchboard-generated prompts never become a session name or intent', () => {
+  const ws = tmpWs('h-generated-name');
+  H.handle({ hook_event_name: 'SessionStart', session_id: 'a', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'a', cwd: ws,
+    user_input: 'Call the `sb_pick` tool with no arguments.' }, { agent: CC });
+  let store = new Store(W.storePath(ws));
+  assert.equal(store.getSession('a').intent, null);
+  assert.equal(store.getSession('a').named, 0);
+  store.close();
+
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'a', cwd: ws,
+    user_input: 'repair checkout tax calculation' }, { agent: CC });
+  store = new Store(W.storePath(ws));
+  assert.equal(store.getSession('a').name, 'repair-checkout-tax-calculat');
+  assert.equal(store.getSession('a').intent, 'repair checkout tax calculation');
+  store.close();
+});
+
+test('sweep backfills task names for older unnamed sessions', () => {
+  const { store, ws } = freshStore('name-backfill');
+  store.upsertSession({ session_id: 'old', workspace: ws, agent_pid: process.pid,
+    name: 'workspace-ab12', alias: 'workspace-ab12', named: 0, intent: 'refactor billing webhooks' });
+  C.sweep(store, ws);
+  assert.equal(store.getSession('old').name, 'refactor-billing-webhooks');
+  assert.equal(store.getSession('old').alias, 'workspace-ab12');
+  store.close();
+});
+
 test('PreCompact snapshots the working set before it is lost (FR-6.4)', () => {
   const ws = tmpWs('h9');
   H.handle({ hook_event_name: 'SessionStart', session_id: 'a', cwd: ws }, { agent: CC });
@@ -787,7 +991,7 @@ test('SessionEnd releases claims so nothing is left phantom-locked (FR-4.5)', ()
   store.close();
 });
 
-test('all four dialects normalise onto the same canonical events (§10.7)', () => {
+test('all three dialects normalise onto the same canonical events (§10.7)', () => {
   const cases = [
     ['claude-code', { hook_event_name: 'SessionStart', session_id: 'x', cwd: '/w' }, 'session-start'],
     ['claude-code', { hook_event_name: 'PostToolUse', session_id: 'x', cwd: '/w' }, 'post-tool'],
@@ -796,8 +1000,6 @@ test('all four dialects normalise onto the same canonical events (§10.7)', () =
     ['gemini-cli',  { hook_event_name: 'SessionStart', session_id: 'x', cwd: '/w' }, 'session-start'],
     ['gemini-cli',  { hook_event_name: 'AfterTool', session_id: 'x', cwd: '/w' }, 'post-tool'],
     ['gemini-cli',  { hook_event_name: 'PreCompress', session_id: 'x', cwd: '/w' }, 'pre-compact'],
-    ['opencode',    { event: 'session.start', sessionID: 'x', directory: '/w' }, 'session-start'],
-    ['opencode',    { event: 'tool.after', sessionID: 'x', directory: '/w' }, 'post-tool'],
   ];
   for (const [agent, payload, expected] of cases) {
     const d = H.DIALECTS[agent];
@@ -873,6 +1075,26 @@ test('apply writes MCP config in the right shape per agent', () => {
   assert.ok(JSON.parse(fs.readFileSync(path.join(ws, '.cursor/mcp.json'), 'utf8')).mcpServers.switchboard);
   assert.ok(JSON.parse(fs.readFileSync(path.join(ws, '.vscode/mcp.json'), 'utf8')).servers.switchboard, 'VS Code uses `servers`');
   assert.ok(JSON.parse(fs.readFileSync(path.join(ws, '.gemini/settings.json'), 'utf8')).mcpServers.switchboard);
+  const openCode = JSON.parse(fs.readFileSync(path.join(ws, 'opencode.json'), 'utf8'));
+  assert.equal(openCode.mcp.switchboard.type, 'local');
+  const expected = I.serverSpec(INSTALL_OPTS);
+  assert.deepEqual(openCode.mcp.switchboard.command, [expected.command, ...expected.args]);
+});
+
+test('OpenCode migrates the legacy config path without losing user settings', () => {
+  const ws = tmpWs('i-opencode-migrate');
+  fs.mkdirSync(path.join(ws, '.opencode'), { recursive: true });
+  fs.writeFileSync(path.join(ws, '.opencode/mcp.json'), JSON.stringify({
+    keep: 'mine',
+    mcpServers: { switchboard: { command: 'npx', args: ['-y', 'switchboard-mcp'] } },
+  }));
+  const target = I.targets(ws, INSTALL_OPTS).find(t => t.agent === 'opencode');
+  target.w.apply();
+  const current = JSON.parse(fs.readFileSync(path.join(ws, 'opencode.json'), 'utf8'));
+  assert.equal(current.mcp.switchboard.type, 'local');
+  const legacy = JSON.parse(fs.readFileSync(path.join(ws, '.opencode/mcp.json'), 'utf8'));
+  assert.equal(legacy.keep, 'mine');
+  assert.ok(!legacy.mcpServers, 'only the stale Switchboard entry is removed');
 });
 
 test('apply is idempotent — a second run writes nothing (FR-1.3)', () => {
@@ -908,6 +1130,38 @@ test('Codex TOML section is written once, however many times init runs', () => {
   const body = fs.readFileSync(t.file, 'utf8');
   assert.equal((body.match(/\[mcp_servers\.switchboard\]/g) || []).length, 1);
   assert.ok(body.includes('command ='));
+});
+
+test('Codex gets a repository-local $sbs skill backed by MCP tools', () => {
+  const ws = tmpWs('i-codex-skill');
+  const skill = I.codexSkill(ws);
+  assert.ok(skill.apply());
+  assert.equal(skill.apply(), null, 'skill install is idempotent');
+  const body = fs.readFileSync(path.join(ws, '.agents/skills/sbs/SKILL.md'), 'utf8');
+  assert.match(body, /^---\nname: sbs\n/);
+  for (const tool of ['sb_pick', 'sb_peers', 'sb_session', 'sb_attach', 'sb_message', 'sb_inbox', 'sb_name']) {
+    assert.ok(body.includes(`\`${tool}\``), `skill must route to ${tool}`);
+  }
+  assert.ok(body.includes('all: true'), 'bare $sbs must include ended sessions in the picker');
+});
+
+test('Codex skill installer never overwrites or removes a user-owned sbs skill', () => {
+  const ws = tmpWs('i-codex-skill-user');
+  const file = path.join(ws, '.agents/skills/sbs/SKILL.md');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, '---\nname: sbs\ndescription: My own skill\n---\n\nKeep me.\n');
+  const skill = I.codexSkill(ws);
+  assert.throws(() => skill.apply(), /refusing to overwrite/);
+  assert.equal(skill.revert(), null);
+  assert.ok(fs.readFileSync(file, 'utf8').includes('Keep me.'));
+});
+
+test('uninstall removes only the Switchboard-managed Codex skill', () => {
+  const ws = tmpWs('i-codex-skill-revert');
+  const skill = I.codexSkill(ws);
+  skill.apply();
+  assert.ok(skill.revert());
+  assert.ok(!fs.existsSync(skill.file));
 });
 
 test('AGENTS.md stanza is written once, inside markers (ADR-0b, RISK-11)', () => {
@@ -995,6 +1249,62 @@ test('hook commands name their agent and event explicitly', () => {
   assert.ok(cmd.includes('--agent gemini-cli') && cmd.includes('--event SessionStart'));
 });
 
+test('published launchers explicitly select the package that owns secondary bins', () => {
+  const spec = I.serverSpec({ platform: 'linux' });
+  assert.deepEqual(spec, {
+    command: 'npx',
+    args: ['-y', '--package', 'switch-board', 'switchboard-mcp'],
+  });
+  const hook = I.hookCommand('claude-code', 'SessionStart', { platform: 'linux' });
+  assert.ok(hook.startsWith('npx -y --package switch-board switchboard-hook '));
+});
+
+test('Windows MCP launchers use the executable npx.cmd shim', () => {
+  assert.equal(I.serverSpec({ platform: 'win32' }).command, 'npx.cmd');
+  assert.ok(I.hookCommand('cursor', 'sessionStart', { platform: 'win32' }).startsWith('npx.cmd '));
+});
+
+test('package metadata exposes every documented executable', () => {
+  const pkg = require('../package.json');
+  assert.equal(pkg.name, 'switch-board');
+  for (const bin of ['switch-board', 'switchboard', 'switchboard-adv',
+    'switchboard-mcp', 'switchboard-hook', 'switchboard-statusline']) {
+    assert.ok(pkg.bin[bin], `missing bin: ${bin}`);
+  }
+  assert.deepEqual(pkg.os, ['darwin', 'linux', 'win32']);
+});
+
+test('rerunning init upgrades stale MCP and hook launcher commands', () => {
+  const ws = tmpWs('i-upgrade-json');
+  fs.mkdirSync(path.join(ws, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(ws, '.mcp.json'), JSON.stringify({
+    keep: true,
+    mcpServers: { switchboard: { command: 'npx', args: ['-y', 'switchboard-mcp'] } },
+  }));
+  fs.writeFileSync(path.join(ws, '.claude/settings.json'), JSON.stringify({
+    theme: 'dark',
+    hooks: { SessionStart: [{ hooks: [{ command: 'npx -y switchboard-hook --agent claude-code --event SessionStart' }] }] },
+  }));
+
+  const targets = I.targets(ws, { all: true, home: FAKE_HOME, platform: 'linux' });
+  const mcp = targets.find(t => t.agent === 'claude-code' && t.kind === 'mcp').w;
+  const hooks = targets.find(t => t.agent === 'claude-code' && t.kind === 'hook').w;
+  assert.equal(mcp.installed(), false);
+  assert.equal(hooks.installed(), false);
+  mcp.apply();
+  hooks.apply();
+
+  const mcpJson = JSON.parse(fs.readFileSync(path.join(ws, '.mcp.json'), 'utf8'));
+  assert.deepEqual(mcpJson.mcpServers.switchboard.args,
+    ['-y', '--package', 'switch-board', 'switchboard-mcp']);
+  assert.equal(mcpJson.keep, true, 'unrelated MCP config survives migration');
+  const settings = JSON.parse(fs.readFileSync(path.join(ws, '.claude/settings.json'), 'utf8'));
+  assert.equal(settings.theme, 'dark', 'unrelated hook config survives migration');
+  assert.ok(JSON.stringify(settings).includes('--package switch-board switchboard-hook'));
+  assert.equal(mcp.installed(), true);
+  assert.equal(hooks.installed(), true);
+});
+
 test('--all never creates user-scoped config for an absent agent', () => {
   const ws = tmpWs('i11');
   const emptyHome = path.join(tmpRoot, 'home-empty');
@@ -1044,6 +1354,24 @@ test('TOML revert deletes a file we authored entirely', () => {
   t.w.revert();
   assert.ok(!fs.existsSync(path.join(home, '.codex/config.toml')),
     'a file we created and fully emptied should not be left behind');
+});
+
+test('Codex TOML migration replaces a stale launcher without touching other sections', () => {
+  const ws = tmpWs('i-toml-upgrade');
+  const home = path.join(tmpRoot, 'home-toml-upgrade');
+  fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+  const toml = path.join(home, '.codex/config.toml');
+  fs.writeFileSync(toml,
+    'model = "gpt-5"\n\n[mcp_servers.switchboard]\ncommand = "npx"\nargs = ["-y", "switchboard-mcp"]\n\n[other]\nkeep = ["a", "b"]\n');
+  const writer = I.targets(ws, { home, platform: 'linux' }).find(x => x.agent === 'codex').w;
+  assert.equal(writer.installed(), false);
+  writer.apply();
+  const body = fs.readFileSync(toml, 'utf8');
+  assert.equal((body.match(/\[mcp_servers\.switchboard\]/g) || []).length, 1);
+  assert.ok(body.includes('"--package", "switch-board", "switchboard-mcp"'));
+  assert.ok(body.includes('model = "gpt-5"') && body.includes('[other]\nkeep = ["a", "b"]'));
+  assert.equal(writer.installed(), true);
+  assert.equal(writer.apply(), null, 'migrated TOML is idempotent');
 });
 
 test('a FRESH workspace still gets hooks — T3, not a silent downgrade', () => {
@@ -1289,7 +1617,10 @@ test('sb_pick elicits a choice and returns that session\'s context', async () =>
   const schema = ask.params.requestedSchema.properties.session;
   assert.ok(Array.isArray(schema.enum) && schema.enum.length >= 1, 'enum renders as a picker');
   assert.ok(schema.enum.some(n => /migrate-auth-tokens/.test(n)), 'sessions are chosen BY NAME');
-  assert.ok(schema.enumNames.some(n => /migrate-auth-tokens/.test(n)), 'labels show the session name');
+  assert.ok(schema.enumNames.includes('migrate-auth-tokens · live'),
+    'picker labels contain only the exact session name and state');
+  assert.ok(schema.enumNames.every(n => !/Switchboard state:|working on|debugging/i.test(n)),
+    'session descriptions never bury the exact name in picker options');
   assert.ok(schema.enumNames.some(n => /live|ended/.test(n)), 'and its state');
 
   // Answer as the user would.
@@ -1405,6 +1736,8 @@ test('the index states counts and explains how to act on it', () => {
   const ws = tmpWs('idx2');
   const WS = W.resolveWorkspace(ws);
   H.handle({ hook_event_name: 'SessionStart', session_id: 'A', cwd: ws }, { agent: CC });
+  H.handle({ hook_event_name: 'UserPromptSubmit', session_id: 'A', cwd: ws,
+    prompt: 'review checkout accessibility' }, { agent: CC });
   const store = new Store(W.storePath(ws));
   const idx = C.sessionIndex(store, WS, null, { all: true });
   assert.ok(/\d+ live session/.test(idx.body), 'says how many are live');
@@ -1890,7 +2223,7 @@ test('the index shows both names so either is discoverable', () => {
   const s2 = new Store(W.storePath(ws));
   const body = C.sessionIndex(s2, WS, null, { all: true }).body;
   assert.ok(body.includes('fix-parser'), 'semantic name');
-  assert.ok(body.includes('aka logline2-b2'), "and the agent's own name");
+  assert.ok(body.includes('native alias: logline2-b2'), "and the agent's own name");
   s2.close();
 });
 
@@ -1918,6 +2251,8 @@ test('lists are addressed purely by name', () => {
   const store = new Store(W.storePath(ws));
   const body = C.sessionIndex(store, WS, null, { all: true }).body;
   assert.ok(body.includes('debug-login-500-errors'), 'name present');
+  assert.ok(body.includes('Exact session name: debug-login-500-errors'));
+  assert.ok(body.includes('Reference exactly as: @debug-login-500-errors'));
   assert.ok(!/sbs\d/.test(body), 'no numbered handles anywhere');
   store.close();
 });
@@ -2279,8 +2614,25 @@ test('an ended peer stops producing updates', () => {
 // ------------------------------------------------------ status line ----
 group('status line indicator');
 
-const { execFileSync } = require('node:child_process');
 const SL_BIN = path.join(__dirname, '..', 'bin', 'switchboard-statusline.js');
+const CLI_BIN = path.join(__dirname, '..', 'bin', 'switchboard.js');
+
+test('bare switch-board command initializes, while help and version remain explicit', () => {
+  const ws = tmpWs('cli-bare-init');
+  const emptyHome = path.join(tmpRoot, 'cli-bare-home');
+  fs.mkdirSync(emptyHome, { recursive: true });
+  const env = { ...process.env, HOME: emptyHome, SWITCHBOARD_HOME: emptyHome, NO_COLOR: '1' };
+  const bare = execFileSync(process.execPath, [CLI_BIN], { cwd: ws, env, encoding: 'utf8' });
+  assert.ok(bare.includes('workspace:'), 'bare invocation enters init');
+  assert.ok(!bare.includes('Usage'), 'bare invocation does not show help');
+  const flagsOnly = execFileSync(process.execPath, [CLI_BIN, '--all', '--dry-run'],
+    { cwd: ws, env, encoding: 'utf8' });
+  assert.ok(flagsOnly.includes('--dry-run: nothing written.'), 'setup flags work without spelling init');
+  const help = execFileSync(process.execPath, [CLI_BIN, '--help'], { cwd: ws, env, encoding: 'utf8' });
+  assert.ok(help.includes('Usage'));
+  assert.equal(execFileSync(process.execPath, [CLI_BIN, '--version'],
+    { cwd: ws, env, encoding: 'utf8' }).trim(), require('../package.json').version);
+});
 
 function renderStatusline(cwd, configDir, sessionId, extraEnv = {}) {
   return execFileSync(process.execPath, [SL_BIN], {
@@ -2410,6 +2762,32 @@ test('install saves the previous statusline and uninstall restores it exactly', 
     assert.deepEqual(after.statusLine, original, 'restored byte-for-byte');
     assert.equal(after.theme, 'dark');
     assert.ok(!fs.existsSync(path.join(cfg, 'switchboard-statusline.json')), 'chain file cleaned up');
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
+test('statusline install upgrades its stale npx launcher without chaining itself', () => {
+  const home = path.join(tmpRoot, 'sl-home-upgrade');
+  const cfg = path.join(home, '.claude');
+  fs.mkdirSync(cfg, { recursive: true });
+  fs.writeFileSync(path.join(cfg, 'settings.json'), JSON.stringify({
+    statusLine: { type: 'command', command: 'npx -y switchboard-statusline' },
+  }));
+  fs.writeFileSync(path.join(cfg, 'switchboard-statusline.json'), JSON.stringify({
+    chain: 'original-statusline', previous: { type: 'command', command: 'original-statusline' },
+  }));
+
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = cfg;
+  try {
+    const sl = I.statusLine({ home, local: false, platform: 'linux' });
+    assert.equal(sl.installed(), false);
+    sl.apply();
+    assert.equal(sl.installed(), true);
+    assert.ok(sl.current().includes('--package switch-board switchboard-statusline'));
+    assert.equal(sl.chained(), 'original-statusline', 'original chain survives migration');
   } finally {
     if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = prev;

@@ -23,13 +23,14 @@ function plain(s) { return String(s).replace(/\x1b\[[0-9;]*m/g, ''); }
 
 // One row, rendered for the list. `sel` draws the highlight bar.
 function row(s, ctx, sel, width) {
-  const name = (s.name || s.session_id.slice(0, 8)).padEnd(32).slice(0, 32);
+  const name = s.name || s.session_id.slice(0, 8);
   const agent = `[${W.agentLabel(s.agent)}]`.padEnd(14).slice(0, 14);
   const state = s.live ? `${c.green}live ${c.reset}` : `${c.dim}ended${c.reset}`;
   const age = D.fmtAge(Date.now() - s.last_seen).padStart(5);
 
-  const head = ` ${c.bold}${name}${c.reset} ${c.cyan}${agent}${c.reset} ${state} ${c.dim}${age}${c.reset}`;
+  const head = ` ${c.bold}Session name: ${name}${c.reset} ${c.cyan}${agent}${c.reset} ${state} ${c.dim}${age}${c.reset}`;
   const lines = [sel ? `${c.inv}${plain(head).padEnd(width - 1)}${c.reset}` : head];
+  lines.push(`       ${c.dim}Reference exactly as: @${s.name || s.session_id.slice(0, 8)}${c.reset}`);
 
   const d = ctx.digestBySession?.[s.session_id];
   const claims = ctx.claimsBySession?.[s.session_id] || [];
@@ -105,7 +106,8 @@ function pickFallback(sessions, ctx, input, output) {
     sessions.forEach((s, i) => {
       const name = s.name || s.session_id.slice(0, 8);
       const state = s.live ? `${c.green}live${c.reset}` : `${c.dim}ended${c.reset}`;
-      output.write(`  ${c.bold}${String(i + 1).padStart(2)}${c.reset}. ${c.bold}${name}${c.reset} ${c.cyan}[${W.agentLabel(s.agent)}]${c.reset} ${state} ${c.dim}${D.fmtAge(Date.now() - s.last_seen)}${c.reset}\n`);
+      output.write(`  ${c.bold}${String(i + 1).padStart(2)}${c.reset}. ${c.bold}Exact session name: ${name}${c.reset} ${c.cyan}[${W.agentLabel(s.agent)}]${c.reset} ${state} ${c.dim}${D.fmtAge(Date.now() - s.last_seen)}${c.reset}\n`);
+      output.write(`      ${c.dim}Reference exactly as: @${name}${c.reset}\n`);
       const desc = D.describe(s, ctx.digestBySession?.[s.session_id]);
       if (desc) output.write(`      ${c.dim}${D.truncate(D.collapse(desc), 78)}${c.reset}\n`);
     });

@@ -259,6 +259,11 @@ function resolveMentions(store, workspace, prompt, selfId) {
 function sessionIndex(store, workspace, selfId, opts = {}) {
   const D2 = require('./digest');
   let sessions = store.attachCandidates(workspace, selfId, W.DEFAULTS.liveTtlMs, opts.maxAgeMs);
+  // A technical bootstrap alias is an implementation detail, not a usable
+  // session name. Never offer it in a human picker. The session becomes
+  // selectable as soon as its first real prompt (or sb_name) names it.
+  const unnamedCount = sessions.filter(s => !hasProperName(s, workspace)).length;
+  sessions = sessions.filter(s => hasProperName(s, workspace));
   const endedCount = sessions.filter(s => !s.live).length;
   // `--all` only widens the list in advanced scope. In normal scope ended
   // sessions are not reachable, so offering them in a picker would be a lie.
@@ -270,8 +275,10 @@ function sessionIndex(store, workspace, selfId, opts = {}) {
     claimsBySession[s.session_id] = store.claimsFor(s.session_id);
     digestBySession[s.session_id] = store.getDigest(s.session_id);
   }
-  const body = D2.renderSessionIndex(sessions, { workspace, claimsBySession, digestBySession, endedCount, all: !!opts.all }, opts);
-  return { body, sessions, endedCount, text: D2.wrapForInjection(body), tokens: D2.estimateTokens(body) };
+  const body = D2.renderSessionIndex(sessions,
+    { workspace, claimsBySession, digestBySession, endedCount, unnamedCount, all: !!opts.all }, opts);
+  return { body, sessions, endedCount, unnamedCount,
+    text: D2.wrapForInjection(body), tokens: D2.estimateTokens(body) };
 }
 
 // Build the context block for every @mentioned session in one prompt.
@@ -387,6 +394,23 @@ function deriveName(agent, workspace, sessionId) {
   return `${base}-${short}`;
 }
 
+// Bootstrap aliases exist only to identify a process before its real task is
+// known. They must never become the address shown in a human picker.
+function isBootstrapName(session, workspace) {
+  const name = String(session?.name || '');
+  if (!name) return true;
+  if (session?.named) return false;
+  if (session?.alias && name === session.alias) return true;
+  const base = require('node:path').basename(workspace || 'workspace')
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^${base}-[0-9a-f]{2,8}$`, 'i').test(name) ||
+    /^(?:claude-code|codex|cursor|gemini-cli)-\d+$/i.test(name);
+}
+
+function hasProperName(session, workspace) {
+  return !!session?.name && !isBootstrapName(session, workspace);
+}
+
 // ---- semantic naming -------------------------------------------------------
 
 // Words that carry no signal about what a session is FOR.
@@ -432,6 +456,19 @@ function deriveLabel(intent, files = []) {
   return null;
 }
 
+// Slash-command expansions and Switchboard's own generated context are not a
+// user's task. Naming a session from them produces labels such as
+// "switchboard-state-0-live", which are technically unique but useless in a
+// picker. Wait for the first substantive request instead.
+function isMeaningfulTask(text) {
+  const s = D.collapse(text).trim();
+  if (!s) return false;
+  return !(/^\/?sbs(?:\s|$)/i.test(s) ||
+    /call the [`']?sb_pick[`']? tool with no arguments/i.test(s) ||
+    /^switchboard state:/i.test(s) ||
+    /^\[switchboard\]/i.test(s));
+}
+
 // A one-line description for lists. Distinct from the name: the name is an
 // address, this is what it is for.
 function deriveDescription(intent, digest) {
@@ -450,7 +487,8 @@ function nameFromWork(store, sessionId, workspace, { intent, files } = {}) {
   const cur = store.getSession(sessionId);
   if (!cur || cur.named) return cur?.name ?? null;
 
-  const label = deriveLabel(intent ?? cur.intent, files);
+  const source = intent ?? cur.intent;
+  const label = deriveLabel(isMeaningfulTask(source) ? source : '', files);
   if (!label) return cur.name;
 
   // Two sessions can legitimately be doing the same thing; disambiguate rather
@@ -540,6 +578,20 @@ function performAttach(store, workspace, target, receivingSessionId, { adopt = f
 // refresh the roster file. Cheap enough to be unconditional (FR-2.4).
 function sweep(store, workspace, ttlMs = W.DEFAULTS.liveTtlMs) {
   const reaped = store.reap(ttlMs);
+  // Upgrade older live rows that still have a technical alias even though a
+  // real task or edited file is already recorded.
+  for (const s of store._all(
+    'SELECT session_id,name,alias,intent FROM sessions WHERE workspace=? AND named=0', workspace)) {
+    // A non-technical name may have been provided by an older client that did
+    // not know about the `named` flag. Preserve it. Native aliases such as
+    // logline2-0a are explicitly eligible for replacement.
+    if (hasProperName(s, workspace)) {
+      store.upsertSession({ session_id: s.session_id, named: 1 });
+      continue;
+    }
+    const d = store.getDigest(s.session_id);
+    nameFromWork(store, s.session_id, workspace, { intent: s.intent, files: d?.files || [] });
+  }
   if (reaped) store.event('reap', { workspace, detail: String(reaped) });
   writeRoster(store, workspace);
   return reaped;
@@ -560,5 +612,6 @@ module.exports = {
   parseMentions, resolveMentions, mentionText, sessionIndex,
   rememberRefs, refDelta, readMode, writeMode, readScope, writeScope,
   writeLink, readLink, consumeLink, crossRepoContext, linkPath,
-  deriveLabel, deriveDescription, nameFromWork,
+  deriveLabel, deriveDescription, isMeaningfulTask, nameFromWork,
+  isBootstrapName, hasProperName,
 };

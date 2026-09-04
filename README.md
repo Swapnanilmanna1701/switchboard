@@ -10,7 +10,7 @@ Switchboard makes those sessions aware of each other. Zero config, zero runtime
 dependencies, no daemon, no editor extension.
 
 ```bash
-npx switchboard init
+npx switch-board
 ```
 
 ---
@@ -19,6 +19,7 @@ npx switchboard init
 
 - [What it does](#what-it-does)
 - [Install](#install)
+- [Compatibility](#compatibility)
 - [How sessions are named](#how-sessions-are-named)
 - [Referencing another session](#referencing-another-session)
 - [The `/sbs` picker](#the-sbs-picker)
@@ -78,24 +79,24 @@ Run /sbs to pick one and continue its work.
 Per repo, from inside the repo:
 
 ```bash
-npx switchboard init
+npx switch-board
 ```
 
 That detects which agents you actually use and writes only their configs. To see
 the plan without writing anything:
 
 ```bash
-npx switchboard init --dry-run
+npx switch-board init --dry-run
 ```
 
 Useful variants:
 
 | Command | Effect |
 |---|---|
-| `npx switchboard init` | Configure detected agents only |
-| `npx switchboard init --all` | Configure every supported agent |
-| `npx switchboard init --local` | Point configs at a local checkout instead of `npx` |
-| `npx switchboard init --dry-run` | Print the plan, write nothing |
+| `npx switch-board` | Configure detected agents only |
+| `npx switch-board init --all` | Configure every supported agent |
+| `npx switch-board init --local` | Point configs at a local checkout instead of `npx` |
+| `npx switch-board init --dry-run` | Print the plan, write nothing |
 
 **Requires Node 22.5.0+** — switchboard uses the built-in `node:sqlite` module,
 which is why it has no dependencies.
@@ -103,8 +104,34 @@ which is why it has no dependencies.
 Verify afterwards:
 
 ```bash
-npx switchboard doctor
+npx switch-board doctor
 ```
+
+## Compatibility
+
+Switchboard is a desktop Node.js CLI, not a browser or mobile application. It
+targets macOS, Linux, and Windows on Node.js 22.5.0 or newer. The package has no
+native add-ons and no third-party runtime dependencies.
+
+Publish once to the npm registry; npm, pnpm, Yarn, and Bun can all download the
+same package:
+
+```bash
+npx switch-board
+pnpm dlx switch-board
+yarn dlx switch-board
+bunx switch-board
+```
+
+`bunx` must be allowed to honor the package's `#!/usr/bin/env node` shebang, and
+Node.js 22.5.0+ must be on `PATH`. Do not use `bunx --bun`: Switchboard uses
+Node's built-in `node:sqlite`, which the Bun runtime does not currently
+implement.
+
+The supported execution matrix is continuously checked on macOS, Linux, and
+Windows against maintained Node.js release lines. Agent integration still
+depends on the installed agent supporting MCP, hooks, or `AGENTS.md`, as listed
+under [Agent support](#agent-support).
 
 ### What `init` writes
 
@@ -115,6 +142,7 @@ agent's own design (for example Codex's `~/.codex/config.toml`).
 .mcp.json                    MCP server registration
 .claude/settings.json        lifecycle hooks
 .claude/commands/sbs.md      the /sbs picker command
+.agents/skills/sbs/SKILL.md  the Codex $sbs workflow
 .vscode/mcp.json             VS Code MCP registration
 AGENTS.md                    a short stanza between markers
 .git/info/exclude            adds .switchboard/ — never your .gitignore
@@ -139,10 +167,11 @@ restyle-checkout-form
 add-password-recovery
 ```
 
-Before a session has done enough to name itself, it falls back to a
-workspace-derived name (`logline2-4c`). A session is **named once and never
-renamed**, so a name you saw an hour ago still refers to the same session.
-Collisions get a short disambiguating suffix.
+Before a session has done enough to name itself, it has an internal bootstrap
+alias, but that alias is never offered in the session picker. Claude Code's
+native session title is also set to the same semantic name. A session is
+**named once and never renamed**, so a name you saw an hour ago still refers
+to the same session. Collisions get a short disambiguating suffix.
 
 There are no `sbs1` / `sbs2` style handles. Names are the only address.
 
@@ -160,17 +189,23 @@ The referenced session's context is resolved and injected before your agent sees
 the prompt. In normal scope this resolves **live sessions in this repo only** —
 naming an ended session simply misses, rather than quietly resurrecting it.
 
-To see what names are available, run `/sbs` (below) or:
+To see what names are available, run `/sbs` in Claude/Cursor, `$sbs` in
+Codex, or:
 
 ```bash
-npx switchboard sessions
+npx switch-board sessions
 ```
+
+Each entry explicitly prints `Exact session name` and `Reference exactly as`.
+Copy that name character-for-character. Do not use the working description,
+agent label, native alias, or a shortened form in its place.
 
 ---
 
-## The `/sbs` picker
+## The `/sbs` and `$sbs` pickers
 
-Type `/sbs` in an agent session, or run `npx switchboard sbs` in a terminal:
+Type `/sbs` in Claude/Cursor, `$sbs` in Codex, or run
+`npx switch-board sbs` in a terminal:
 
 ```
   switchboard  /Users/you/code/api
@@ -201,8 +236,8 @@ a numbered prompt that accepts a number, a name, or a name prefix.
 Select without the picker:
 
 ```bash
-npx switchboard sbs fix-login-500-errors
-npx switchboard sbs <name> --run   # pick, then launch claude immediately
+npx switch-board sbs fix-login-500-errors
+npx switch-board sbs <name> --run   # pick, then launch claude immediately
 ```
 
 The list is live sessions in this repo. `--all` widens it to ended sessions
@@ -220,7 +255,7 @@ Just ask, in plain language:
 Or explicitly:
 
 ```bash
-npx switchboard attach fix-astro-dev-server
+npx switch-board attach fix-astro-dev-server
 ```
 
 Attaching returns that session's full working context — its intent, every file
@@ -269,7 +304,7 @@ a service and its shared schema package.
 
 ```bash
 cd ~/code/web
-npx switchboard-adv        # ← in a plain terminal, BEFORE starting your agent
+npx --package switch-board switchboard-adv  # before starting your agent
 ```
 
 Every repo with a live session is listed, sessions nested underneath:
@@ -294,9 +329,9 @@ The next agent session you start in that repo opens already holding the chosen
 session's context.
 
 ```bash
-npx switchboard-adv --list      # show open repos, pick nothing
-npx switchboard-adv --status    # what's pending
-npx switchboard-adv --clear     # drop it, back to normal scope
+npx --package switch-board switchboard-adv --list    # show open repos
+npx --package switch-board switchboard-adv --status  # what's pending
+npx --package switch-board switchboard-adv --clear   # back to normal
 ```
 
 **Why a separate command run beforehand.** Three properties fall out of that
@@ -315,18 +350,18 @@ ordering, and all three are the point:
 ## CLI reference
 
 ```
-npx switchboard init [--dry-run] [--all] [--local]
-npx switchboard status [--json] [--raw]
-npx switchboard sbs [name] [--run] [--all]
-npx switchboard sessions [--all]
-npx switchboard attach [name] [--list] [--adopt] [--cancel]
-npx switchboard board
-npx switchboard doctor
-npx switchboard statusline install|uninstall|status
-npx switchboard uninstall [--purge]
-npx switchboard purge
+npx switch-board init [--dry-run] [--all] [--local]
+npx switch-board status [--json] [--raw]
+npx switch-board sbs [name] [--run] [--all]
+npx switch-board sessions [--all]
+npx switch-board attach [name] [--list] [--adopt] [--cancel]
+npx switch-board board
+npx switch-board doctor
+npx switch-board statusline install|uninstall|status
+npx switch-board uninstall [--purge]
+npx switch-board purge
 
-npx switchboard-adv [--list] [--status] [--clear]
+npx --package switch-board switchboard-adv [--list] [--status] [--clear]
 ```
 
 | Command | What it does |
@@ -354,7 +389,7 @@ npx switchboard-adv [--list] [--status] [--clear]
 ### Status line
 
 ```bash
-npx switchboard statusline install
+npx switch-board statusline install
 ```
 
 Adds a `[switchboard]` badge to your agent's status line, chaining any status
@@ -365,11 +400,12 @@ no peer counts, no session handles, nothing that reads like a name.
 
 ## MCP tools
 
-Switchboard registers an MCP server exposing eight tools. Agents call these on
+Switchboard registers one MCP server exposing sixteen tools. Agents call these on
 their own; you rarely invoke them directly.
 
 | Tool | Purpose |
 |---|---|
+| `sb_name` | Give the current session a stable task-based name for lists and references |
 | `sb_peers` | List other live sessions, what each is doing, which files each claimed |
 | `sb_session` | Full working context of one named session |
 | `sb_search` | Search findings and notes posted by any session |
@@ -378,6 +414,13 @@ their own; you rarely invoke them directly.
 | `sb_attach` | Load another session's context to continue its work |
 | `sb_pick` | Show the interactive picker and return the chosen session |
 | `sb_handoff` | Compose a context handoff for another live session |
+| `sb_message` | Send a durable private message to another live session |
+| `sb_broadcast` | Announce a blocker or decision to every session in the workspace |
+| `sb_inbox` | Read unread direct messages and broadcasts |
+| `sb_tasks` | List, create, and update shared workspace tasks |
+| `sb_assign` | Assign a shared task to a named session |
+| `sb_diff` | Inspect the tracked Git diff for another session's recorded files |
+| `sb_release` | Release some or all file claims owned by this session |
 
 `sb_claim` matters most on agents without hook support — it's the only way your
 claims become visible to others there.
@@ -395,13 +438,17 @@ warnings happen automatically, no prompting needed.
 - Claude Code
 - Cursor
 - Gemini CLI
-- OpenCode
 
-**MCP support — tools work, hooks don't exist.** The agent must call `sb_peers`
-and `sb_claim` itself; the `AGENTS.md` stanza tells it to.
+**MCP support — tools work, lifecycle hooks are not configured by
+Switchboard.** The agent must call `sb_peers` and `sb_claim` itself; the
+`AGENTS.md` stanza tells it to.
 
-- Windsurf, Codex CLI, Copilot, Cline, Roo Code, Kilo Code, Continue, Zed,
+- OpenCode, Windsurf, Codex CLI, Copilot, Cline, Roo Code, Kilo Code, Continue, Zed,
   Goose, Qwen Code, Amazon Q, Aider
+
+Codex also receives the repository-local `sbs` skill, so its native picker
+invocation is `$sbs`. `$sbs continue <exact-name>` attaches to a named session;
+`@<exact-name>` reads it as context without changing the current session.
 
 **Anything else** — any agent that reads `AGENTS.md` gets the roster file at
 `.switchboard/ROSTER.md`, which is plain Markdown.
@@ -455,8 +502,8 @@ Everything lives in `.switchboard/` inside the repo, which `init` adds to
 ```
 
 Stored per session: a short intent line, file paths opened and touched, commands
-run, and notes explicitly posted. **Not** stored: prompts, model responses, or
-transcripts.
+run, notes explicitly posted, coordination messages, and shared tasks. **Not**
+stored: prompts, model responses, or transcripts.
 
 ### The one file outside your repo
 
@@ -479,7 +526,7 @@ read-only or sandboxed.
 Inspect exactly what's there before trusting it:
 
 ```bash
-npx switchboard status --raw
+npx switch-board status --raw
 ```
 
 ---
@@ -489,10 +536,11 @@ npx switchboard status --raw
 **Nothing leaves your machine.** No network calls, no telemetry, no account. The
 database is a local file.
 
-**Secrets are redacted on write.** Digests are pattern-scanned before persisting
-— GitHub tokens, `sk-` keys, AWS key shapes, `Bearer` tokens, PEM private key
-headers. This is a safety net, not a guarantee: it's pattern matching, and it is
-documented as imperfect. Don't rely on it to catch a novel credential format.
+**Secrets are redacted on write.** Shared text—including digests, notes,
+messages, broadcasts, and tasks—is pattern-scanned before persisting: GitHub
+tokens, `sk-` keys, AWS key shapes, `Bearer` tokens, and PEM private key headers.
+This is a safety net, not a guarantee: it is pattern matching and may not catch
+a novel credential format.
 
 **Cross-session content is treated as untrusted.** Context injected from another
 session is wrapped in an explicit envelope marking it as data, not instructions,
@@ -514,7 +562,7 @@ covers `.switchboard/` and `*.db*` too.
 ## Troubleshooting
 
 **"No sessions found" but sessions are clearly running.**
-Run `npx switchboard doctor`. It surfaces `schemaError`, which is the usual
+Run `npx switch-board doctor`. It surfaces `schemaError`, which is the usual
 cause — a schema mismatch makes every write fail while fail-open hides the
 error, so the tool looks healthy and returns nothing.
 
@@ -524,12 +572,12 @@ Should not happen — liveness follows the process, not activity. If it does,
 
 **`/sbs` prints a list instead of an interactive picker.**
 Either stdin isn't a TTY, or your build doesn't advertise MCP elicitation. The
-numbered fallback accepts a number, a name, or a prefix. `npx switchboard sbs`
+numbered fallback accepts a number, a name, or a prefix. `npx switch-board sbs`
 straight from the terminal always gets the arrow-key version.
 
 **Config changes don't seem to apply.**
 `init` compares content, not just file existence, so re-running it updates an
-already-initialised repo. Run `npx switchboard init` again.
+already-initialised repo. Run `npx switch-board init` again.
 
 **`CLAUDE.md` is a symlink to `AGENTS.md`.**
 Detected and handled — switchboard won't write a stanza that makes the file
@@ -540,9 +588,9 @@ import itself.
 ## Uninstalling
 
 ```bash
-npx switchboard uninstall           # remove configs, keep data
-npx switchboard uninstall --purge   # remove configs and data
-npx switchboard purge               # drop data, keep configs
+npx switch-board uninstall           # remove configs, keep data
+npx switch-board uninstall --purge   # remove configs and data
+npx switch-board purge               # drop data, keep configs
 ```
 
 `uninstall` removes only what `init` wrote, including its `AGENTS.md` stanza
@@ -555,7 +603,7 @@ between the markers.
 ```bash
 git clone https://github.com/swapnanilhoichoi/test.git switchboard
 cd switchboard
-node test/test.js      # 177 tests, no framework, no fixtures
+node test/test.js      # no framework, no fixtures
 ```
 
 Zero runtime dependencies and zero dev dependencies. The test suite is plain
@@ -582,7 +630,7 @@ bin/switchboard-statusline.js  status line renderer
 src/store.js                   SQLite, migrations, liveness
 src/core.js                    session registration, naming, mentions
 src/digest.js                  digests, redaction, rendering
-src/mcp.js                     JSON-RPC and the eight tools
+src/mcp.js                     JSON-RPC and the sixteen tools
 src/hook.js                    per-agent hook dialects
 src/installers.js              config writers for every agent
 src/picker.js                  arrow-key TUI, flat and nested

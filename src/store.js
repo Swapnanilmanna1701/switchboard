@@ -7,7 +7,7 @@ const { DatabaseSync } = require('node:sqlite');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 // Columns added after v1 shipped. `CREATE TABLE IF NOT EXISTS` does NOT alter
 // an existing table, so without this an upgraded install keeps its old schema,
@@ -110,6 +110,38 @@ CREATE TABLE IF NOT EXISTS refs (
   PRIMARY KEY (session_id, target_id)
 );
 CREATE INDEX IF NOT EXISTS idx_refs_ws ON refs(workspace, session_id);
+
+-- Durable direct messages and broadcasts. Broadcasts have a NULL target and
+-- message_reads tracks delivery independently for every receiving session.
+CREATE TABLE IF NOT EXISTS messages (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace    TEXT NOT NULL,
+  from_session TEXT NOT NULL,
+  to_session   TEXT,
+  created_at   INTEGER NOT NULL,
+  text         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_ws ON messages(workspace, created_at);
+
+CREATE TABLE IF NOT EXISTS message_reads (
+  message_id INTEGER NOT NULL,
+  session_id TEXT NOT NULL,
+  read_at    INTEGER NOT NULL,
+  PRIMARY KEY (message_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace   TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  details     TEXT,
+  status      TEXT NOT NULL DEFAULT 'open', -- open | in_progress | done | cancelled
+  created_by  TEXT NOT NULL,
+  assigned_to TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_ws ON tasks(workspace, status, updated_at);
 
 CREATE TABLE IF NOT EXISTS events (
   ts          INTEGER,
@@ -331,6 +363,21 @@ class Store {
 
   releaseClaims(sessionId) { this._run('DELETE FROM claims WHERE session_id=?', sessionId); }
 
+  releaseSelectedClaims(sessionId, paths) {
+    const list = [...new Set((paths || []).filter(Boolean))];
+    if (!list.length) {
+      const before = this.claimsFor(sessionId).length;
+      this.releaseClaims(sessionId);
+      return before;
+    }
+    let released = 0;
+    for (const p of list) {
+      const r = this._run('DELETE FROM claims WHERE session_id=? AND path=?', sessionId, p);
+      released += Number(r?.changes || 0);
+    }
+    return released;
+  }
+
   // ---- digests ------------------------------------------------------------
 
   putDigest(d) {
@@ -481,6 +528,85 @@ class Store {
   notesBySession(sessionId, limit = 20) {
     return this._all('SELECT * FROM notes WHERE session_id=? ORDER BY created_at DESC LIMIT ?',
       sessionId, limit);
+  }
+
+  // ---- messages ----------------------------------------------------------
+
+  addMessage({ workspace, from_session, to_session = null, text }) {
+    const r = this._run(
+      'INSERT INTO messages(workspace,from_session,to_session,created_at,text) VALUES(?,?,?,?,?)',
+      workspace, from_session, to_session, Date.now(), text);
+    return r ? Number(r.lastInsertRowid) : null;
+  }
+
+  unreadMessages(workspace, sessionId, limit = 30) {
+    return this._all(
+      `SELECT m.*, s.name AS from_name
+         FROM messages m
+         LEFT JOIN sessions s ON s.session_id=m.from_session
+         LEFT JOIN message_reads r ON r.message_id=m.id AND r.session_id=?
+       WHERE m.workspace=? AND m.from_session!=?
+          AND (m.to_session IS NULL OR m.to_session=? OR m.to_session IN (
+            SELECT peer.session_id FROM sessions peer
+              JOIN sessions me ON me.session_id=?
+             WHERE peer.workspace=? AND peer.agent=me.agent
+               AND peer.link_key=me.link_key AND me.link_key IS NOT NULL
+          )) AND r.message_id IS NULL
+        ORDER BY m.created_at ASC LIMIT ?`,
+      sessionId, workspace, sessionId, sessionId, sessionId, workspace, limit);
+  }
+
+  markMessagesRead(sessionId, ids) {
+    const now = Date.now();
+    for (const id of ids || []) {
+      this._run('INSERT OR IGNORE INTO message_reads(message_id,session_id,read_at) VALUES(?,?,?)',
+        id, sessionId, now);
+    }
+  }
+
+  // ---- shared tasks ------------------------------------------------------
+
+  addTask({ workspace, title, details = null, created_by, assigned_to = null }) {
+    const now = Date.now();
+    const r = this._run(
+      `INSERT INTO tasks(workspace,title,details,status,created_by,assigned_to,created_at,updated_at)
+       VALUES(?,?,?,'open',?,?,?,?)`,
+      workspace, title, details, created_by, assigned_to, now, now);
+    return r ? Number(r.lastInsertRowid) : null;
+  }
+
+  tasks(workspace, { status = null, assignedTo = null, limit = 50 } = {}) {
+    return this._all(
+      `SELECT t.*, a.name AS assigned_name, c.name AS creator_name
+         FROM tasks t
+         LEFT JOIN sessions a ON a.session_id=t.assigned_to
+         LEFT JOIN sessions c ON c.session_id=t.created_by
+        WHERE t.workspace=? AND (? IS NULL OR t.status=?)
+          AND (? IS NULL OR t.assigned_to=?)
+        ORDER BY CASE t.status WHEN 'in_progress' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
+                 t.updated_at DESC LIMIT ?`,
+      workspace, status, status, assignedTo, assignedTo, limit);
+  }
+
+  getTask(workspace, id) {
+    return this._get('SELECT * FROM tasks WHERE workspace=? AND id=?', workspace, id);
+  }
+
+  updateTask(workspace, id, { title, details, status } = {}) {
+    const task = this.getTask(workspace, id);
+    if (!task) return null;
+    this._run(
+      `UPDATE tasks SET title=?, details=?, status=?, updated_at=? WHERE workspace=? AND id=?`,
+      title ?? task.title, details ?? task.details, status ?? task.status, Date.now(), workspace, id);
+    return this.getTask(workspace, id);
+  }
+
+  assignTask(workspace, id, sessionId) {
+    const r = this._run(
+      `UPDATE tasks SET assigned_to=?, status=CASE WHEN status='open' THEN 'in_progress' ELSE status END,
+                        updated_at=? WHERE workspace=? AND id=?`,
+      sessionId, Date.now(), workspace, id);
+    return Number(r?.changes || 0) ? this.getTask(workspace, id) : null;
   }
 
   // ---- active references --------------------------------------------------

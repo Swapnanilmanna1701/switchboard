@@ -15,7 +15,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { execFileSync } = require('node:child_process');
+const { execSync } = require('node:child_process');
 
 const CONFIG = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'),
   'switchboard-statusline.json');
@@ -53,7 +53,8 @@ function runChained(raw) {
   const cmd = cfg?.chain;
   if (!cmd || typeof cmd !== 'string') return '';
   try {
-    return execFileSync('/bin/sh', ['-c', cmd], {
+    // Node selects /bin/sh on Unix and process.env.ComSpec on Windows.
+    return execSync(cmd, {
       input: raw, encoding: 'utf8', timeout: TIMEOUT_MS,
       stdio: ['pipe', 'pipe', 'ignore'],
     }).replace(/\n+$/, '');

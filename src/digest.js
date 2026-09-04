@@ -94,8 +94,13 @@ function renderPeer(peer, claims, digest, workspace, opts = {}) {
   const agent = opts.showAgent === false ? '' : ` [${agentLabel(peer.agent)}]`;
   const intent = peer.intent || digest?.intent || '';
 
-  const lines = [`• ${name}${agent} — ${status}`];
-  if (intent) lines.push(`  ${truncate(collapse(intent), 90)}`);
+  const lines = [
+    '• SESSION',
+    `  Exact session name: ${name}`,
+    `  Reference exactly as: @${name}`,
+    `  ${agent.trim()}${agent ? ' — ' : ''}${status}`,
+  ];
+  if (intent) lines.push(`  Working on: ${truncate(collapse(intent), 90)}`);
 
   if (claims && claims.length) {
     const observed = claims.every(c => c.observed);
@@ -105,7 +110,7 @@ function renderPeer(peer, claims, digest, workspace, opts = {}) {
     const prov = observed ? '' : ' (self-declared)';
     lines.push(`  editing: ${shown.join(', ')}${more}${prov}`);
   } else {
-    lines[0] += ' — no claims yet';
+    lines.push('  editing: no claims yet');
   }
 
   if (digest?.last_msg) lines.push(`  latest: ${truncate(collapse(digest.last_msg), 160)}`);
@@ -226,6 +231,11 @@ function renderSessionIndex(sessions, ctx = {}, opts = {}) {
   const cap = opts.maxTokens ?? 1500;
   const workspace = ctx.workspace;
   if (!sessions || !sessions.length) {
+    if (ctx.unnamedCount) {
+      return `[switchboard] No properly named sessions are available yet.\n` +
+        `${ctx.unnamedCount} bootstrap session${ctx.unnamedCount === 1 ? ' is' : 's are'} hidden from the picker until ` +
+        `its first substantive task is submitted or it calls sb_name.`;
+    }
     // Never silently imply "nothing here" when ended sessions exist.
     return ctx.endedCount
       ? `[switchboard] No sessions are live in this workspace.\n` +
@@ -239,18 +249,26 @@ function renderSessionIndex(sessions, ctx = {}, opts = {}) {
   const L = [`[switchboard] ${live.length} live session${live.length === 1 ? '' : 's'} in this workspace` +
              (ended.length ? `, ${ended.length} ended` : '') +
              (hidden ? ` (${hidden} ended hidden — --all to show)` : '') + ':'];
+  if (ctx.unnamedCount) {
+    L.push(`${ctx.unnamedCount} bootstrap session${ctx.unnamedCount === 1 ? '' : 's'} hidden until properly named.`);
+  }
 
   const row = s => {
     const name = s.name || s.session_id.slice(0, 8);
     const claims = ctx.claimsBySession?.[s.session_id] || [];
     const d = ctx.digestBySession?.[s.session_id];
     // The name IS the address. Nothing else identifies a session.
-    const alias = s.alias && s.alias !== name ? `  aka ${s.alias}` : '';
-    const out = [`  ${name}${alias}  [${agentLabel(s.agent)}]  ${s.live ? s.status : 'ended'} ${ago(Date.now() - s.last_seen)}`];
+    const alias = s.alias && s.alias !== name ? ` (native alias: ${s.alias})` : '';
+    const out = [
+      '  SESSION',
+      `    Exact session name: ${name}${alias}`,
+      `    Reference exactly as: @${name}`,
+      `    [${agentLabel(s.agent)}]  ${s.live ? s.status : 'ended'} ${ago(Date.now() - s.last_seen)}`,
+    ];
     const intent = describe(s, d);
-    if (intent) out.push(`        ${truncate(collapse(intent), 88)}`);
-    if (claims.length) out.push(`        files: ${claims.slice(0, 3).map(c => relTo(workspace, c.path)).join(', ')}`);
-    else if (d?.files?.length) out.push(`        files: ${d.files.slice(-3).join(', ')}`);
+    if (intent) out.push(`    Working on: ${truncate(collapse(intent), 88)}`);
+    if (claims.length) out.push(`    Files: ${claims.slice(0, 3).map(c => relTo(workspace, c.path)).join(', ')}`);
+    else if (d?.files?.length) out.push(`    Files: ${d.files.slice(-3).join(', ')}`);
     return out.join('\n');
   };
 
@@ -258,7 +276,8 @@ function renderSessionIndex(sessions, ctx = {}, opts = {}) {
   if (ended.length) { L.push('', 'ENDED (still attachable):'); for (const s of ended) L.push(row(s)); }
 
   L.push('');
-  L.push('Reference a session in a prompt with @<name>, e.g. @' + (sessions[0].name || 'session-name') + '.');
+  L.push('Copy the exact session name shown above; do not shorten or rewrite it after @.');
+  L.push('Example: @' + (sessions[0].name || 'session-name') + '.');
   L.push('Run /sbs to pick one and continue its work.');
   return capText(L.join('\n'), cap);
 }
