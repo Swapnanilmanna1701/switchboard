@@ -32,6 +32,7 @@ function open() {
     const { DatabaseSync } = require('node:sqlite');
     fs.mkdirSync(dir(), { recursive: true });
     const db = new DatabaseSync(file());
+    db.exec('PRAGMA busy_timeout=1000');
     db.exec(`
       CREATE TABLE IF NOT EXISTS open_sessions (
         session_id TEXT PRIMARY KEY,

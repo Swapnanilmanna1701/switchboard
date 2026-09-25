@@ -34,6 +34,9 @@ for (const k of Object.keys(c)) if (!supportsColor) c[k] = s => String(s);
 const workspace = W.resolveWorkspace(process.cwd());
 
 function main() {
+  if (has('global') || (cmd === 'init' && !W.gitRoot(process.cwd()))) {
+    return require('../src/global-cli').run({ command: cmd, dryRun: has('dry-run'), json: has('json'), purge: has('purge') });
+  }
   switch (cmd) {
     case 'init':      return init();
     case 'status':    return status();
@@ -499,6 +502,10 @@ ${c.b('switchboard')} ${c.dim(`v${pkg.version}`)} — ambient shared working mem
 ${c.b('Usage')}
   npx ${pkg.name}                              # initialize this repository
   npx ${pkg.name} init [--dry-run] [--all] [--local]
+  switchboard init --global                 # Claude + Codex, any local terminal
+  switchboard status --global               # live sessions outside repositories
+  switchboard doctor --global
+  switchboard uninstall --global
   npx ${pkg.name} status [--json] [--raw]
   npx ${pkg.name} sbs [name] [--run] [--all]  # picker, or select by name
   npx ${pkg.name} sessions [--all]            # live sessions in THIS repo
@@ -518,6 +525,7 @@ ${c.b('Cross-repo (advanced)')}
   connect the next session to one in another repo. Applies once, then expires.
 
 ${c.b('Flags')}
+  --global    configure Claude and Codex for this user, from any directory
   --dry-run   show the plan, write nothing
   --all       configure every supported agent, not just detected ones
   --local     point configs at this checkout instead of npx
@@ -535,4 +543,4 @@ ${c.dim('Docs: switchboard-prd.md · switchboard-compatibility-report.md')}
 function rel(p) { const r = path.relative(process.cwd(), p); return r && !r.startsWith('..') ? r : p; }
 function pad(s, n) { const t = String(s); return t.length >= n ? t : t + ' '.repeat(n - t.length); }
 
-main();
+try { main(); } catch (error) { console.error(`Switchboard: ${error.message}`); process.exitCode = 1; }

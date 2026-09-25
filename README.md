@@ -1,6 +1,6 @@
 # switchboard
 
-**Ambient shared working memory for concurrent AI coding sessions in one workspace.**
+**Local shared working memory for AI coding sessions in repositories and ordinary terminals.**
 
 You open five agent sessions in one repo. Each starts blind. None knows what the
 others found, decided, or are mid-edit on — so *you* become the message bus,
@@ -19,6 +19,7 @@ npx switch-board
 
 - [What it does](#what-it-does)
 - [Install](#install)
+- [Connect Claude and Codex in local terminals](#connect-claude-and-codex-in-local-terminals)
 - [Compatibility](#compatibility)
 - [How sessions are named](#how-sessions-are-named)
 - [Referencing another session](#referencing-another-session)
@@ -51,8 +52,8 @@ find it — including sessions started tomorrow.
 **4. Attach.** Pick any live session and continue its work with its full
 context.
 
-By default a session can reach exactly one thing: **live sessions in its own
-repo**. Ended sessions and other repos are out of scope until you opt in — see
+Repository sessions see **live sessions in their own repo**. With global setup,
+sessions outside Git repositories instead share a local terminal group. Ended sessions and other repos are out of scope until you opt in — see
 [Scope](#scope-normal-and-advanced).
 
 A fresh session receives something like this automatically at startup:
@@ -71,6 +72,80 @@ A fresh session receives something like this automatically at startup:
 Reference a session in a prompt with @<name>, e.g. @fix-login-500-errors.
 Run /sbs to pick one and continue its work.
 ```
+
+---
+
+## Connect Claude and Codex in local terminals
+
+Install Switchboard once for your user account and configure the integrations:
+
+```bash
+npm install -g switch-board
+switchboard init --global
+```
+
+For development with this checkout, use `node bin/switchboard.js init --global`.
+Global setup points at this installed copy, so keep it in place. Re-run setup
+if you move the checkout or change your Node installation. No sudo or daemon is needed.
+Running `switchboard` without a command outside a Git repository also performs
+global setup. Inside a Git repository, the existing repository setup is used.
+
+Restart Claude and Codex after setup. They can run in separate ordinary
+terminals, including different folders outside Git repositories:
+
+```text
+Terminal 1: cd ~           → claude
+Terminal 2: cd ~/Downloads → codex
+```
+
+Give each agent its task. Then ask either one:
+
+> Show my other Switchboard sessions and connect to the Claude/Codex session.
+
+The agent uses `sb_peers` to discover the other session and `sb_session` or
+`sb_attach` to read its saved context. Session names come from the actual task.
+Ask an agent to send a message to that exact session name; the recipient reads
+it through `sb_inbox`. Messages are stored locally and do **not** wake an idle
+agent, type into a terminal, or automatically execute work. `sb_note` saves
+progress for the other terminal. Claude hooks additionally record observed
+activity; Codex shares the notes and claims it explicitly reports through MCP.
+Attachments share recorded summaries, not full chat transcripts.
+
+All sessions outside Git repositories under the same user account share one
+local terminal group, including its notes, messages, tasks and file claims.
+Git repository sessions remain separate, one group per repository. Starting a
+terminal at your home directory does not scan your files or join all your repos.
+This connects agents on the same computer and account, not different machines.
+
+Global setup manages only Switchboard entries in:
+
+- `~/.claude.json`: user-scoped Claude MCP server.
+- `~/.claude/settings.json`: Claude lifecycle hooks.
+- `~/.claude/CLAUDE.md`: a marked instructions block.
+- `~/.codex/config.toml`: Codex MCP server.
+- `~/.codex/AGENTS.md`: a marked instructions block.
+- `~/.switchboard/global.json`: enables the shared terminal group.
+
+Existing settings are preserved. `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and
+`SWITCHBOARD_HOME` overrides are supported. Context is stored in
+`~/.switchboard/terminals/state.db` with a readable `ROSTER.md` beside it.
+The global discovery index remains at `~/.switchboard/index.db`.
+
+```bash
+switchboard init --global --dry-run  # inspect setup without changing files
+switchboard doctor --global         # verify integrations
+switchboard status --global         # see ordinary-terminal sessions from anywhere
+switchboard uninstall --global      # restore managed settings; keep saved history
+```
+
+Uninstall restores the previous Switchboard settings and preserves unrelated
+settings and instructions. If a managed entry was changed after installation,
+uninstall reports it and leaves it untouched. Restart agents after uninstall.
+
+The setup uses the documented user configuration locations for
+[Claude MCP](https://code.claude.com/docs/en/mcp),
+[Claude settings](https://code.claude.com/docs/en/settings), and
+[Codex MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
 ---
 

@@ -865,6 +865,7 @@ function revert(workspace, opts = {}) {
 }
 
 module.exports = {
+  mcpShapeD, tomlSection, stripTomlSection,
   targets, plan, apply, revert, agentsMd, claudeBridge, agentPresent, statusLine, slashCommands, codexSkill,
   serverSpec, hookCommand, STANZA, STANZA_BODY, MARK_BEGIN, MARK_END,
   CODEX_SKILL_BODY, CODEX_SKILL_MARK,

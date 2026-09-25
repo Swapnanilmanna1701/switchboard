@@ -143,8 +143,10 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
 
   // Hooks carry the agent's own session id, which is authoritative. Fall back
   // to the pid-derived identity the MCP server uses so the two rows converge.
-  const fallback = C.resolveIdentity({ agent, cwd, agent_pid: agentPid });
-  const sessionId = r.session_id || fallback.session_id;
+  const fallback = C.resolveIdentity({ agent, cwd, agent_pid: agentPid, store });
+  const existing = W.isTerminalWorkspace(ws) ? store.getSession(fallback.session_id) : null;
+  const sessionId = existing && existing.status !== 'ended'
+    ? existing.session_id : r.session_id || fallback.session_id;
   const synthetic = r.session_id ? 0 : fallback.synthetic;
 
   let out = null;
@@ -157,7 +159,7 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
         C.ensureStoreDir(ws);
         C.registerSession(store, {
           session_id: sessionId, cwd, workspace: ws, agent,
-          name: nameFor(agent, sessionId, ws, agentPid),
+          name: existing?.named ? existing.name : nameFor(agent, sessionId, ws, agentPid),
           alias: nameFor(agent, sessionId, ws, agentPid),   // the agent's own name
           tier: 3,                       // hooks present ⇒ T3 (store max()'s it)
           synthetic,
@@ -169,25 +171,8 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
         // the user went to a terminal, browsed other repos and picked one
         // before starting this session. That is the most explicit intent we
         // will ever see. One-shot — consumeLink deletes it.
-        const link = C.consumeLink(ws);
-        if (link) {
-          const cross = C.crossRepoContext(link);
-          if (cross) { out = cross.text; break; }
-        }
-
-        // An explicit `switchboard attach` beats the ambient roster: the user
-        // asked for one specific session's work, so give them that instead of
-        // a summary of everyone. One-shot — consumed here so it can never
-        // silently hijack a later session.
-        const pending = store.pendingAttach(ws);
-        if (pending) {
-          store.consumeAttach(pending.id, sessionId);
-          const target = store.getSession(pending.target_id);
-          if (target) {
-            const r = C.performAttach(store, ws, target, sessionId, { adopt: !!pending.adopt });
-            if (r) { out = r.text; break; }
-          }
-        }
+        const startup = C.startupContext(store, ws, sessionId);
+        if (startup) { out = startup; break; }
 
         const inj = C.injectionText(store, ws, sessionId);
         if (inj.text) {
@@ -199,6 +184,7 @@ function handle(raw, { agent = 'claude-code', eventOverride = null } = {}) {
       }
 
       case EV.PROMPT: {
+        store.event('prompt', { session_id: sessionId, workspace: ws });
         // FR-6.2: the first prompt is the session's intent.
         const me = store.getSession(sessionId);
         if (C.isMeaningfulTask(r.prompt) && (!me?.intent || !C.isMeaningfulTask(me.intent))) {

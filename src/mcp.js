@@ -371,7 +371,7 @@ class McpServer {
     const client = params?.clientInfo || {};
     this.clientCaps = params?.capabilities || {};
     this.agent = W.normalizeAgent(client.name);
-    const ident = C.resolveIdentity({ agent: this.agent, cwd: this.cwd, agent_pid: this.agentPid });
+    const ident = C.resolveIdentity({ agent: this.agent, cwd: this.cwd, agent_pid: this.agentPid, store: this.ctx.store });
     this.sessionId = ident.session_id;
     this.name = ident.name || C.deriveName(this.agent, this.ctx.workspace, this.sessionId);
 
@@ -398,19 +398,22 @@ class McpServer {
     const requested = params?.protocolVersion;
     const version = typeof requested === 'string' && requested >= '2024-11-05'
       ? requested : PROTOCOL_VERSION;
+    const startup = this.ctx.ok ? C.startupContext(this.ctx.store, this.ctx.workspace, this.sessionId) : '';
 
     this.reply(id, {
       protocolVersion: version,
       capabilities: { tools: { listChanged: false } },
       serverInfo: SERVER_INFO,
       instructions:
+        (W.isTerminalWorkspace(this.ctx.workspace)
+          ? 'You are connected to Switchboard local terminals. Sessions outside Git repositories under this user account share this group, even from different directories. Use sb_peers to find another terminal, sb_session or sb_attach to read its saved context, and sb_message/sb_inbox to exchange messages. Messages are read when the recipient checks its inbox; they do not wake another terminal. ' : '') +
         'Other AI coding sessions may be working in this workspace right now. Call sb_inbox and ' +
         'sb_peers before starting a task to collect messages, see what peers are doing, and avoid ' +
         'claimed files. After the first substantive user request, call sb_name with a short summary ' +
         'of that task so this session is recognizable in pickers. Every session entry labels its ' +
         'Exact session name. When the user writes ' +
         '@<name>, copy that name character-for-character into sb_session; never infer or shorten it. ' +
-        'Post findings with sb_note so later sessions can find them.',
+        'Post findings with sb_note so later sessions can find them.' + (startup ? `\n\n${startup}` : ''),
     });
   }
 
@@ -446,9 +449,9 @@ class McpServer {
           return 'Could not create a useful session name from Switchboard or slash-command text. Pass the actual user task.';
         }
         if (!current?.intent || !C.isMeaningfulTask(current.intent)) {
-          store.upsertSession({ session_id: self, intent: D.truncate(D.collapse(task), 200) });
+          store.upsertSession({ session_id: self, intent: D.redact(D.truncate(D.collapse(task), 200)) });
         }
-        const name = C.nameFromWork(store, self, ws, { intent: task });
+        const name = C.nameFromWork(store, self, ws, { intent: D.redact(task) });
         C.writeRoster(store, ws);
         return name
           ? `Exact session name: ${name}\nReference exactly as: @${name}`
@@ -510,7 +513,8 @@ class McpServer {
         if (!list.length) return 'No paths given; nothing claimed.';
         const conflicts = [];
         for (const p of list) {
-          const abs = path.isAbsolute(p) ? p : path.resolve(ws, p);
+          const base = W.isTerminalWorkspace(ws) ? this.cwd : ws;
+          const abs = path.resolve(base, p);
           const foreign = store.foreignClaims(ws, abs, self);
           if (foreign.length) conflicts.push(D.renderCollisionWarning(abs, foreign, ws));
           // T1 claims are self-declared (observed = 0) — provenance is kept.
@@ -527,7 +531,8 @@ class McpServer {
 
       sb_release: ({ paths } = {}) => {
         const requested = Array.isArray(paths) ? paths.filter(Boolean).map(String) : [];
-        const absolute = requested.map(p => path.isAbsolute(p) ? path.normalize(p) : path.resolve(ws, p));
+        const base = W.isTerminalWorkspace(ws) ? this.cwd : ws;
+        const absolute = requested.map(p => path.resolve(base, p));
         const released = store.releaseSelectedClaims(self, absolute);
         C.writeRoster(store, ws);
         return requested.length
@@ -621,6 +626,7 @@ class McpServer {
       },
 
       sb_diff: ({ name }) => {
+        if (W.isTerminalWorkspace(ws)) return 'These sessions are outside Git repositories. No repository diff is available; use sb_session to inspect recorded files and notes.';
         const target = C.findTarget(store, ws, name, self);
         if (!target) return `No live session matches "${name}". Call sb_peers to see available names.`;
         const digest = store.getDigest(target.session_id);

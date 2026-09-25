@@ -101,6 +101,7 @@ function renderPeer(peer, claims, digest, workspace, opts = {}) {
     `  ${agent.trim()}${agent ? ' — ' : ''}${status}`,
   ];
   if (intent) lines.push(`  Working on: ${truncate(collapse(intent), 90)}`);
+  if (require('./workspace').isTerminalWorkspace(workspace) && peer.cwd) lines.push(`  Directory: ${peer.cwd}`);
 
   if (claims && claims.length) {
     const observed = claims.every(c => c.observed);
@@ -292,6 +293,7 @@ function renderSessionDetail({ session, digest, claims, notes, workspace }, opts
   const name = session.name || session.session_id.slice(0, 8);
   const L = [];
   L.push(`${name} [${agentLabel(session.agent)}] · ${session.live === false ? 'ended' : session.status} ${ago(Date.now() - session.last_seen)}`);
+  if (session.cwd) L.push(`Directory: ${session.cwd}`);
   if (session.intent || digest?.intent) L.push(`Working on: ${session.intent || digest.intent}`);
   if (digest?.last_msg) L.push(`Latest: ${digest.last_msg}`);
   if (claims?.length) {
@@ -317,6 +319,7 @@ function renderAttachContext({ session, digest, claims, notes, workspace }, opts
 
   const L = [];
   L.push(`You are continuing the work of "${name}" [${agentLabel(session.agent)}] (${state}).`);
+  if (session.cwd) L.push(`Directory: ${session.cwd}`);
   L.push('');
   if (session.intent || digest?.intent) L.push(`WHAT IT WAS DOING: ${session.intent || digest.intent}`);
   if (digest?.last_msg) L.push(`WHERE IT GOT TO: ${digest.last_msg}`);

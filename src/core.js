@@ -122,9 +122,27 @@ function readLink(workspace) {
 // One-shot. Reading it consumes it, so a link never silently applies to a
 // second session you started for an unrelated reason.
 function consumeLink(workspace) {
-  const link = readLink(workspace);
-  try { fs.rmSync(linkPath(workspace), { force: true }); } catch { /* best effort */ }
-  return link;
+  const claimed = `${linkPath(workspace)}.${process.pid}.${require('node:crypto').randomUUID()}`;
+  try {
+    fs.renameSync(linkPath(workspace), claimed);
+    const link = JSON.parse(fs.readFileSync(claimed, 'utf8'));
+    return link.workspace && link.session_id && Date.now() - (link.created_at ?? 0) <= LINK_TTL_MS ? link : null;
+  } catch { return null; }
+  finally { try { fs.rmSync(claimed, { force: true }); } catch { /* best effort */ } }
+}
+
+// Either MCP or hooks can be the first integration to start. Both use this
+// path, and consuming a queued attachment must succeed before delivering it.
+function startupContext(store, workspace, sessionId) {
+  const link = consumeLink(workspace);
+  if (link) {
+    const cross = crossRepoContext(link);
+    if (cross) return cross.text;
+  }
+  const pending = store.pendingAttach(workspace);
+  if (!pending || !store.consumeAttach(pending.id, sessionId)) return '';
+  const target = store.getSession(pending.target_id);
+  return target ? performAttach(store, workspace, target, sessionId, { adopt: !!pending.adopt })?.text || '' : '';
 }
 
 // Pull the linked session's context out of ITS OWN repo store. This is the one
@@ -367,12 +385,22 @@ function refDelta(store, workspace, sessionId, opts = {}) {
 // ponytail: pid-keyed identity, one row per agent process. If an agent ever
 // runs several logical sessions in one process, key on its own session id
 // instead — the store already accepts any string.
-function resolveIdentity({ agent, cwd, agent_pid }) {
+function resolveIdentity({ agent, cwd, agent_pid, store }) {
   if (agent === 'claude-code' && agent_pid) {
     const s = W.claudeSessionByPid(agent_pid);
     if (s?.session_id) {
       return { session_id: s.session_id, name: s.name, agent_ver: s.version, synthetic: 0 };
     }
+  }
+  // User-level hooks may start before MCP. Outside repositories, reuse that
+  // registration even when Claude's optional native session registry is absent.
+  if (store && W.isTerminalWorkspace(W.resolveWorkspace(cwd))) {
+    const rows = store._all("SELECT * FROM sessions WHERE agent=? AND link_key=? AND status!='ended'",
+      agent, W.linkKey(cwd, agent_pid));
+    if (rows.length === 1) return { session_id: rows[0].session_id, name: rows[0].name,
+      agent_ver: rows[0].agent_ver, synthetic: rows[0].synthetic };
+    return { session_id: `${agent}-${agent_pid || process.pid}-${require('node:crypto').randomUUID()}`,
+      name: null, agent_ver: null, synthetic: 1 };
   }
   // No authoritative id available: derive one from the agent pid and mark it
   // synthetic, so a hook that later registers the real id absorbs this row
@@ -511,9 +539,8 @@ function attachContext(store, workspace, targetId, opts = {}) {
   const session = store.getSession(targetId);
   if (!session) return null;
   const W2 = require('./workspace');
-  const live = session.status !== 'ended' &&
-    (Date.now() - session.last_seen) < (opts.ttlMs ?? W2.DEFAULTS.liveTtlMs) &&
-    require('./store').isPidAlive(session.agent_pid ?? session.pid);
+  const live = require('./store').isSessionLive(session,
+    opts.ttlMs ?? W2.DEFAULTS.liveTtlMs, store.staleMs);
   return {
     session: { ...session, live },
     digest: store.getDigest(targetId),
@@ -539,10 +566,14 @@ function findTarget(store, workspace, needle, selfId) {
       // to something semantic.
       || all.find(s => (s.alias || '').toLowerCase() === want)
       || all.find(s => s.session_id.toLowerCase() === want)
-      || all.find(s => (s.name || '').toLowerCase().startsWith(want))
-      || all.find(s => (s.alias || '').toLowerCase().startsWith(want))
-      || all.find(s => s.session_id.toLowerCase().startsWith(want))
+      || uniquePrefix(all, want)
       || null;
+}
+
+function uniquePrefix(sessions, prefix) {
+  const matches = sessions.filter(s => [s.name, s.alias, s.session_id]
+    .some(value => value && value.toLowerCase().startsWith(prefix)));
+  return matches.length === 1 ? matches[0] : null;
 }
 
 // Render the takeover payload, wrapped as untrusted peer data (§13.8), and
@@ -612,6 +643,7 @@ module.exports = {
   parseMentions, resolveMentions, mentionText, sessionIndex,
   rememberRefs, refDelta, readMode, writeMode, readScope, writeScope,
   writeLink, readLink, consumeLink, crossRepoContext, linkPath,
+  startupContext,
   deriveLabel, deriveDescription, isMeaningfulTask, nameFromWork,
   isBootstrapName, hasProperName,
 };

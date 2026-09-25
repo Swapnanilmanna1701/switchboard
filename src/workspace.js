@@ -11,7 +11,7 @@ const path = require('node:path');
 const os = require('node:os');
 
 const HOME = os.homedir();
-const CLAUDE_DIR = path.join(HOME, '.claude');
+const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude');
 
 const DEFAULTS = {
   liveTtlMs:      120_000,   // FR-2.2 — fallback only, when we have no pid
@@ -29,6 +29,9 @@ const DEFAULTS = {
 // first that produces a stable root wins.
 function resolveWorkspace(cwd) {
   const abs = path.resolve(cwd || process.cwd());
+  // Global setup gives ordinary terminals one shared workspace. Git sessions
+  // retain their own boundary; an IDE window must not capture unrelated shells.
+  if (globalEnabled()) return gitRoot(abs) || terminalWorkspace();
   const viaIde = ideWorkspaceFor(abs);
   if (viaIde) return viaIde;
   const viaGit = gitRoot(abs);
@@ -77,7 +80,14 @@ function isWithin(child, parent) {
 
 // ---- store location --------------------------------------------------------
 
-function storeDir(workspace) { return path.join(workspace, '.switchboard'); }
+function userDir(home = process.env.SWITCHBOARD_HOME || os.homedir()) {
+  return path.join(home, '.switchboard');
+}
+function globalConfigPath(home) { return path.join(userDir(home), 'global.json'); }
+function globalEnabled() { return readJson(globalConfigPath())?.terminalSharing === true; }
+function terminalWorkspace(home) { return path.join(userDir(home), 'terminals'); }
+function isTerminalWorkspace(workspace) { return typeof workspace === 'string' && path.resolve(workspace) === terminalWorkspace(); }
+function storeDir(workspace) { return isTerminalWorkspace(workspace) ? workspace : path.join(workspace, '.switchboard'); }
 function storePath(workspace) { return path.join(storeDir(workspace), 'state.db'); }
 function rosterPath(workspace) { return path.join(storeDir(workspace), 'ROSTER.md'); }
 
@@ -201,6 +211,7 @@ module.exports = {
   DEFAULTS, HOME, CLAUDE_DIR, AGENTS,
   resolveWorkspace, gitRoot, isWithin, ideWorkspaceFor,
   storeDir, storePath, rosterPath,
+  userDir, globalConfigPath, globalEnabled, terminalWorkspace, isTerminalWorkspace,
   claudeSessionByPid, claudeSessionsInWorkspace,
   agentPid, linkKey, normalizeAgent, agentLabel,
   readJson, writeFileAtomic, gitExclude,

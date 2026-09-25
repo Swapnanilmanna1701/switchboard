@@ -172,22 +172,35 @@ class Store {
     this.db = null;
     this.fts = false;
     this.ok = false;
-    try {
-      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-      this.db = new DatabaseSync(dbPath);
-      this.db.exec('PRAGMA journal_mode=WAL');
-      this.db.exec('PRAGMA busy_timeout=50');   // ADR-5: give up fast, never hang a hook
-      this.db.exec('PRAGMA synchronous=NORMAL');
-      this.db.exec(SCHEMA);
-      this.migrate();
-      try { this.db.exec(FTS_SCHEMA); this.fts = true; } catch { this.fts = false; }
-      this.db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)')
-        .run('schema_version', String(SCHEMA_VERSION));
-      try { fs.chmodSync(dbPath, 0o600); } catch { /* best effort */ }
-      this.ok = true;
-    } catch (e) {
-      this.ok = false;
-      this.error = e;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+        this.db = new DatabaseSync(dbPath);
+        // Two terminals may create the same store simultaneously. Install the
+        // busy handler BEFORE WAL/schema setup, then restore the short write budget.
+        this.db.exec('PRAGMA busy_timeout=1000');
+        this.db.exec('PRAGMA journal_mode=WAL');
+        this.db.exec('PRAGMA synchronous=NORMAL');
+        this.db.exec(SCHEMA);
+        this.migrate();
+        try { this.db.exec(FTS_SCHEMA); this.fts = true; } catch { this.fts = false; }
+        this.db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)')
+          .run('schema_version', String(SCHEMA_VERSION));
+        this.db.exec('PRAGMA busy_timeout=50');
+        try { fs.chmodSync(dbPath, 0o600); } catch { /* best effort */ }
+        this.ok = true;
+        this.error = null;
+        break;
+      } catch (e) {
+        this.ok = false;
+        this.error = e;
+        try { this.db?.close(); } catch { /* partially opened */ }
+        this.db = null;
+        // Concurrent first-open WAL transitions can return SQLITE_BUSY without
+        // invoking SQLite's busy handler. Release the connection before retrying.
+        if (!/locked|busy/i.test(e.message || '') || attempt === 4) break;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1));
+      }
     }
   }
 
@@ -501,8 +514,9 @@ class Store {
   }
 
   consumeAttach(id, sessionId) {
-    this._run('UPDATE attachments SET consumed_by=?, consumed_at=? WHERE id=? AND consumed_by IS NULL',
+    const result = this._run('UPDATE attachments SET consumed_by=?, consumed_at=? WHERE id=? AND consumed_by IS NULL',
       sessionId, Date.now(), id);
+    return Number(result?.changes || 0) === 1;
   }
 
   cancelAttach(workspace) {
