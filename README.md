@@ -676,7 +676,7 @@ between the markers.
 ## Development
 
 ```bash
-git clone https://github.com/swapnanilhoichoi/test.git switchboard
+git clone https://github.com/Swapnanilmanna1701/switchboard.git switchboard
 cd switchboard
 node test/test.js      # no framework, no fixtures
 ```
