@@ -1,5 +1,5 @@
 {
-  "name": "switch-board",
+  "name": "@swapnanilmanna1701/switch-board",
   "version": "0.1.0",
   "description": "Ambient shared working memory for concurrent AI coding sessions in one workspace.",
   "repository": {

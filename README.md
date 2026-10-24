@@ -10,7 +10,7 @@ Switchboard makes those sessions aware of each other. Zero config, zero runtime
 dependencies, no daemon, no editor extension.
 
 ```bash
-npx switch-board
+npx @swapnanilmanna1701/switch-board
 ```
 
 ---
@@ -80,7 +80,7 @@ Run /sbs to pick one and continue its work.
 Install Switchboard once for your user account and configure the integrations:
 
 ```bash
-npm install -g switch-board
+npm install -g @swapnanilmanna1701/switch-board
 switchboard init --global
 ```
 
@@ -154,24 +154,24 @@ The setup uses the documented user configuration locations for
 Per repo, from inside the repo:
 
 ```bash
-npx switch-board
+npx @swapnanilmanna1701/switch-board
 ```
 
 That detects which agents you actually use and writes only their configs. To see
 the plan without writing anything:
 
 ```bash
-npx switch-board init --dry-run
+npx @swapnanilmanna1701/switch-board init --dry-run
 ```
 
 Useful variants:
 
 | Command | Effect |
 |---|---|
-| `npx switch-board` | Configure detected agents only |
-| `npx switch-board init --all` | Configure every supported agent |
-| `npx switch-board init --local` | Point configs at a local checkout instead of `npx` |
-| `npx switch-board init --dry-run` | Print the plan, write nothing |
+| `npx @swapnanilmanna1701/switch-board` | Configure detected agents only |
+| `npx @swapnanilmanna1701/switch-board init --all` | Configure every supported agent |
+| `npx @swapnanilmanna1701/switch-board init --local` | Point configs at a local checkout instead of `npx` |
+| `npx @swapnanilmanna1701/switch-board init --dry-run` | Print the plan, write nothing |
 
 **Requires Node 22.5.0+** — switchboard uses the built-in `node:sqlite` module,
 which is why it has no dependencies.
@@ -179,7 +179,7 @@ which is why it has no dependencies.
 Verify afterwards:
 
 ```bash
-npx switch-board doctor
+npx @swapnanilmanna1701/switch-board doctor
 ```
 
 ## Compatibility
@@ -192,10 +192,10 @@ Publish once to the npm registry; npm, pnpm, Yarn, and Bun can all download the
 same package:
 
 ```bash
-npx switch-board
-pnpm dlx switch-board
-yarn dlx switch-board
-bunx switch-board
+npx @swapnanilmanna1701/switch-board
+pnpm dlx @swapnanilmanna1701/switch-board
+yarn dlx @swapnanilmanna1701/switch-board
+bunx @swapnanilmanna1701/switch-board
 ```
 
 `bunx` must be allowed to honor the package's `#!/usr/bin/env node` shebang, and
@@ -268,7 +268,7 @@ To see what names are available, run `/sbs` in Claude/Cursor, `$sbs` in
 Codex, or:
 
 ```bash
-npx switch-board sessions
+npx @swapnanilmanna1701/switch-board sessions
 ```
 
 Each entry explicitly prints `Exact session name` and `Reference exactly as`.
@@ -280,7 +280,7 @@ agent label, native alias, or a shortened form in its place.
 ## The `/sbs` and `$sbs` pickers
 
 Type `/sbs` in Claude/Cursor, `$sbs` in Codex, or run
-`npx switch-board sbs` in a terminal:
+`npx @swapnanilmanna1701/switch-board sbs` in a terminal:
 
 ```
   switchboard  /Users/you/code/api
@@ -311,8 +311,8 @@ a numbered prompt that accepts a number, a name, or a name prefix.
 Select without the picker:
 
 ```bash
-npx switch-board sbs fix-login-500-errors
-npx switch-board sbs <name> --run   # pick, then launch claude immediately
+npx @swapnanilmanna1701/switch-board sbs fix-login-500-errors
+npx @swapnanilmanna1701/switch-board sbs <name> --run   # pick, then launch claude immediately
 ```
 
 The list is live sessions in this repo. `--all` widens it to ended sessions
@@ -330,7 +330,7 @@ Just ask, in plain language:
 Or explicitly:
 
 ```bash
-npx switch-board attach fix-astro-dev-server
+npx @swapnanilmanna1701/switch-board attach fix-astro-dev-server
 ```
 
 Attaching returns that session's full working context — its intent, every file
@@ -379,7 +379,7 @@ a service and its shared schema package.
 
 ```bash
 cd ~/code/web
-npx --package switch-board switchboard-adv  # before starting your agent
+npx --package @swapnanilmanna1701/switch-board switchboard-adv  # before starting your agent
 ```
 
 Every repo with a live session is listed, sessions nested underneath:
@@ -404,9 +404,9 @@ The next agent session you start in that repo opens already holding the chosen
 session's context.
 
 ```bash
-npx --package switch-board switchboard-adv --list    # show open repos
-npx --package switch-board switchboard-adv --status  # what's pending
-npx --package switch-board switchboard-adv --clear   # back to normal
+npx --package @swapnanilmanna1701/switch-board switchboard-adv --list    # show open repos
+npx --package @swapnanilmanna1701/switch-board switchboard-adv --status  # what's pending
+npx --package @swapnanilmanna1701/switch-board switchboard-adv --clear   # back to normal
 ```
 
 **Why a separate command run beforehand.** Three properties fall out of that
@@ -425,18 +425,18 @@ ordering, and all three are the point:
 ## CLI reference
 
 ```
-npx switch-board init [--dry-run] [--all] [--local]
-npx switch-board status [--json] [--raw]
-npx switch-board sbs [name] [--run] [--all]
-npx switch-board sessions [--all]
-npx switch-board attach [name] [--list] [--adopt] [--cancel]
-npx switch-board board
-npx switch-board doctor
-npx switch-board statusline install|uninstall|status
-npx switch-board uninstall [--purge]
-npx switch-board purge
+npx @swapnanilmanna1701/switch-board init [--dry-run] [--all] [--local]
+npx @swapnanilmanna1701/switch-board status [--json] [--raw]
+npx @swapnanilmanna1701/switch-board sbs [name] [--run] [--all]
+npx @swapnanilmanna1701/switch-board sessions [--all]
+npx @swapnanilmanna1701/switch-board attach [name] [--list] [--adopt] [--cancel]
+npx @swapnanilmanna1701/switch-board board
+npx @swapnanilmanna1701/switch-board doctor
+npx @swapnanilmanna1701/switch-board statusline install|uninstall|status
+npx @swapnanilmanna1701/switch-board uninstall [--purge]
+npx @swapnanilmanna1701/switch-board purge
 
-npx --package switch-board switchboard-adv [--list] [--status] [--clear]
+npx --package @swapnanilmanna1701/switch-board switchboard-adv [--list] [--status] [--clear]
 ```
 
 | Command | What it does |
@@ -464,7 +464,7 @@ npx --package switch-board switchboard-adv [--list] [--status] [--clear]
 ### Status line
 
 ```bash
-npx switch-board statusline install
+npx @swapnanilmanna1701/switch-board statusline install
 ```
 
 Adds a `[switchboard]` badge to your agent's status line, chaining any status
@@ -601,7 +601,7 @@ read-only or sandboxed.
 Inspect exactly what's there before trusting it:
 
 ```bash
-npx switch-board status --raw
+npx @swapnanilmanna1701/switch-board status --raw
 ```
 
 ---
@@ -637,7 +637,7 @@ covers `.switchboard/` and `*.db*` too.
 ## Troubleshooting
 
 **"No sessions found" but sessions are clearly running.**
-Run `npx switch-board doctor`. It surfaces `schemaError`, which is the usual
+Run `npx @swapnanilmanna1701/switch-board doctor`. It surfaces `schemaError`, which is the usual
 cause — a schema mismatch makes every write fail while fail-open hides the
 error, so the tool looks healthy and returns nothing.
 
@@ -647,12 +647,12 @@ Should not happen — liveness follows the process, not activity. If it does,
 
 **`/sbs` prints a list instead of an interactive picker.**
 Either stdin isn't a TTY, or your build doesn't advertise MCP elicitation. The
-numbered fallback accepts a number, a name, or a prefix. `npx switch-board sbs`
+numbered fallback accepts a number, a name, or a prefix. `npx @swapnanilmanna1701/switch-board sbs`
 straight from the terminal always gets the arrow-key version.
 
 **Config changes don't seem to apply.**
 `init` compares content, not just file existence, so re-running it updates an
-already-initialised repo. Run `npx switch-board init` again.
+already-initialised repo. Run `npx @swapnanilmanna1701/switch-board init` again.
 
 **`CLAUDE.md` is a symlink to `AGENTS.md`.**
 Detected and handled — switchboard won't write a stanza that makes the file
@@ -663,9 +663,9 @@ import itself.
 ## Uninstalling
 
 ```bash
-npx switch-board uninstall           # remove configs, keep data
-npx switch-board uninstall --purge   # remove configs and data
-npx switch-board purge               # drop data, keep configs
+npx @swapnanilmanna1701/switch-board uninstall           # remove configs, keep data
+npx @swapnanilmanna1701/switch-board uninstall --purge   # remove configs and data
+npx @swapnanilmanna1701/switch-board purge               # drop data, keep configs
 ```
 
 `uninstall` removes only what `init` wrote, including its `AGENTS.md` stanza

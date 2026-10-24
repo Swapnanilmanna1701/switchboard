@@ -1253,10 +1253,10 @@ test('published launchers explicitly select the package that owns secondary bins
   const spec = I.serverSpec({ platform: 'linux' });
   assert.deepEqual(spec, {
     command: 'npx',
-    args: ['-y', '--package', 'switch-board', 'switchboard-mcp'],
+    args: ['-y', '--package', '@swapnanilmanna1701/switch-board', 'switchboard-mcp'],
   });
   const hook = I.hookCommand('claude-code', 'SessionStart', { platform: 'linux' });
-  assert.ok(hook.startsWith('npx -y --package switch-board switchboard-hook '));
+  assert.ok(hook.startsWith('npx -y --package @swapnanilmanna1701/switch-board switchboard-hook '));
 });
 
 test('Windows MCP launchers use the executable npx.cmd shim', () => {
@@ -1266,7 +1266,7 @@ test('Windows MCP launchers use the executable npx.cmd shim', () => {
 
 test('package metadata exposes every documented executable', () => {
   const pkg = require('../package.json');
-  assert.equal(pkg.name, 'switch-board');
+  assert.equal(pkg.name, '@swapnanilmanna1701/switch-board');
   for (const bin of ['switch-board', 'switchboard', 'switchboard-adv',
     'switchboard-mcp', 'switchboard-hook', 'switchboard-statusline']) {
     assert.ok(pkg.bin[bin], `missing bin: ${bin}`);
@@ -1296,11 +1296,11 @@ test('rerunning init upgrades stale MCP and hook launcher commands', () => {
 
   const mcpJson = JSON.parse(fs.readFileSync(path.join(ws, '.mcp.json'), 'utf8'));
   assert.deepEqual(mcpJson.mcpServers.switchboard.args,
-    ['-y', '--package', 'switch-board', 'switchboard-mcp']);
+    ['-y', '--package', '@swapnanilmanna1701/switch-board', 'switchboard-mcp']);
   assert.equal(mcpJson.keep, true, 'unrelated MCP config survives migration');
   const settings = JSON.parse(fs.readFileSync(path.join(ws, '.claude/settings.json'), 'utf8'));
   assert.equal(settings.theme, 'dark', 'unrelated hook config survives migration');
-  assert.ok(JSON.stringify(settings).includes('--package switch-board switchboard-hook'));
+  assert.ok(JSON.stringify(settings).includes('--package @swapnanilmanna1701/switch-board switchboard-hook'));
   assert.equal(mcp.installed(), true);
   assert.equal(hooks.installed(), true);
 });
@@ -1368,7 +1368,7 @@ test('Codex TOML migration replaces a stale launcher without touching other sect
   writer.apply();
   const body = fs.readFileSync(toml, 'utf8');
   assert.equal((body.match(/\[mcp_servers\.switchboard\]/g) || []).length, 1);
-  assert.ok(body.includes('"--package", "switch-board", "switchboard-mcp"'));
+  assert.ok(body.includes('"--package", "@swapnanilmanna1701/switch-board", "switchboard-mcp"'));
   assert.ok(body.includes('model = "gpt-5"') && body.includes('[other]\nkeep = ["a", "b"]'));
   assert.equal(writer.installed(), true);
   assert.equal(writer.apply(), null, 'migrated TOML is idempotent');
@@ -2786,7 +2786,7 @@ test('statusline install upgrades its stale npx launcher without chaining itself
     assert.equal(sl.installed(), false);
     sl.apply();
     assert.equal(sl.installed(), true);
-    assert.ok(sl.current().includes('--package switch-board switchboard-statusline'));
+    assert.ok(sl.current().includes('--package @swapnanilmanna1701/switch-board switchboard-statusline'));
     assert.equal(sl.chained(), 'original-statusline', 'original chain survives migration');
   } finally {
     if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
