@@ -2,6 +2,14 @@
   "name": "switch-board",
   "version": "0.1.0",
   "description": "Ambient shared working memory for concurrent AI coding sessions in one workspace.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Swapnanilmanna1701/switchboard.git"
+  },
+  "homepage": "https://github.com/Swapnanilmanna1701/switchboard#readme",
+  "bugs": {
+    "url": "https://github.com/Swapnanilmanna1701/switchboard/issues"
+  },
   "type": "commonjs",
   "bin": {
     "switch-board": "bin/switchboard.js",
